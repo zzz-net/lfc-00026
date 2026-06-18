@@ -103,6 +103,10 @@ python test_api.py
 | POST | /api/admin/menus/{id}/items | 添加菜品 |
 | PATCH | /api/admin/menu-items/{id} | 更新菜品 |
 | POST | /api/admin/menus/{id}/publish | 发布菜单 |
+| POST | /api/admin/menus/import/json | 批量导入菜单(JSON) |
+| POST | /api/admin/menus/import/csv | 批量导入菜单(CSV文件) |
+| GET | /api/admin/menus/export/json | 导出菜单(JSON) |
+| GET | /api/admin/menus/export/csv | 导出菜单(CSV) |
 | GET | /api/admin/reconciliation | 对账检查 |
 
 ### 员工端接口
@@ -285,8 +289,13 @@ git check-ignore -v canteen.db canteen.db-wal canteen.db-shm
 │   ├── order_service.py     # 订单服务
 │   └── transaction_service.py # 流水和对账服务
 ├── test_api.py              # API测试脚本
+├── verify_reboot.py         # 重启一致性验证脚本
 ├── requirements.txt         # 依赖列表
-├── canteen.db               # (运行时生成，不提交)
-├── canteen.db-wal           # (运行时生成，不提交)
-└── canteen.db-shm           # (运行时生成，不提交)
+├── .gitignore               # 忽略规则（含数据库和缓存）
+│
+│   # 以下为运行时产物，不进入提交
+├── canteen.db               # SQLite 主库（首次启动生成）
+├── canteen.db-wal           # WAL 写入日志（运行中生成，正常关闭后回收）
+├── canteen.db-shm           # WAL 共享内存（运行中生成，正常关闭后删除）
+└── __pycache__/             # Python 字节码缓存
 ```

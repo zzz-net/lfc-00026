@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File
+from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 from database import init_db
 from services import (
@@ -11,6 +11,7 @@ from services import (
     OrderService,
     TransactionService,
     ReconciliationService,
+    MenuImportExportService,
 )
 
 app = FastAPI(
@@ -148,6 +149,77 @@ def admin_publish_menu(menu_id: int):
         return MenuService.publish_menu(menu_id)
     except ValueError as e:
         error_response(str(e), "PUBLISH_ERROR")
+
+
+@app.post("/api/admin/menus/import/json", tags=["管理员"], summary="批量导入菜单(JSON)")
+def admin_import_menus_json(
+    data: List[dict],
+    conflict_strategy: str = Query("skip", description="冲突策略: skip=跳过, update_draft=更新草稿, report=仅报告冲突"),
+):
+    try:
+        result = MenuImportExportService.import_menus_from_json(data, conflict_strategy)
+        if not result["success"] and result["errors"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": {
+                        "code": "IMPORT_VALIDATION_ERROR",
+                        "message": "导入数据校验失败",
+                        "errors": result["errors"],
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_ERROR")
+
+
+@app.post("/api/admin/menus/import/csv", tags=["管理员"], summary="批量导入菜单(CSV文件)")
+def admin_import_menus_csv(
+    file: UploadFile = File(..., description="CSV文件"),
+    conflict_strategy: str = Query("skip", description="冲突策略: skip=跳过, update_draft=更新草稿, report=仅报告冲突"),
+):
+    try:
+        content = file.file.read().decode("utf-8-sig")
+        result = MenuImportExportService.import_menus_from_csv(content, conflict_strategy)
+        if not result["success"] and result["errors"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": {
+                        "code": "IMPORT_VALIDATION_ERROR",
+                        "message": "导入数据校验失败",
+                        "errors": result["errors"],
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_ERROR")
+    except UnicodeDecodeError:
+        error_response("文件编码错误，请使用 UTF-8 编码", "IMPORT_ENCODING_ERROR", 400)
+
+
+@app.get("/api/admin/menus/export/json", tags=["管理员"], summary="导出菜单(JSON)")
+def admin_export_menus_json(
+    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+):
+    return MenuImportExportService.export_menus_json(start_date, end_date)
+
+
+@app.get("/api/admin/menus/export/csv", tags=["管理员"], summary="导出菜单(CSV)")
+def admin_export_menus_csv(
+    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+):
+    csv_content = MenuImportExportService.export_menus_csv(start_date, end_date)
+    filename = f"menus_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ========== 员工 - 菜单浏览 ==========
