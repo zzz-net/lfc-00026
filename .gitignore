@@ -22,6 +22,8 @@ coverage/
 *.log
 *.sqlite
 *.db
+*.db-wal
+*.db-shm
 *.tmp
 tmp/
 temp/
