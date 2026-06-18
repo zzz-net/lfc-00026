@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
@@ -13,6 +14,13 @@ from services import (
     ReconciliationService,
     MenuImportExportService,
 )
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="食堂订餐扣费系统",

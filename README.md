@@ -143,6 +143,248 @@ python test_api.py
 | ORDER_STATUS_ERROR | 订单状态不允许操作 |
 | ALREADY_TAKEN | 已取餐，无法取消 |
 
+## 菜单批量导入导出
+
+管理员可以一次性导入一周的菜单，也可以将当前菜单导出备份。支持 JSON 和 CSV 两种格式。
+
+### 文件格式说明
+
+#### JSON 格式
+
+根节点为菜单数组，每个菜单包含 `items` 菜品数组：
+
+```json
+[
+  {
+    "name": "周一午餐",
+    "serving_date": "2026-07-01",
+    "deadline": "2026-07-01 09:00:00",
+    "is_published": false,
+    "items": [
+      {"name": "红烧肉", "price": 18.0, "stock": 50},
+      {"name": "番茄炒蛋", "price": 12.0, "stock": 100},
+      {"name": "米饭", "price": 2.0, "stock": 200}
+    ]
+  }
+]
+```
+
+#### CSV 格式
+
+每行一道菜，菜单级字段（日期、名称、截止时间、发布状态）每行重复：
+
+```csv
+serving_date,menu_name,deadline,is_published,item_name,price,stock
+2026-07-01,周一午餐,2026-07-01 09:00:00,0,红烧肉,18.0,50
+2026-07-01,周一午餐,2026-07-01 09:00:00,0,番茄炒蛋,12.0,100
+2026-07-01,周一午餐,2026-07-01 09:00:00,0,米饭,2.0,200
+2026-07-02,周二午餐,2026-07-02 09:00:00,0,清蒸鱼,25.0,30
+```
+
+CSV 必需列：`serving_date`, `menu_name`, `deadline`, `item_name`, `price`, `stock`
+可选列：`is_published`（0=草稿，1=已发布，默认0）
+
+### 字段校验规则
+
+| 字段 | 规则 |
+|------|------|
+| serving_date | 格式 YYYY-MM-DD，不能为空 |
+| menu_name / name | 菜单名称，不能为空 |
+| deadline | 格式 YYYY-MM-DD HH:MM:SS，不能为空 |
+| item_name / name | 菜品名称，不能为空 |
+| price | 非负数字，不能为空 |
+| stock | 非负整数，不能为空 |
+| is_published | 0/false/no 为草稿，1/true/yes 为已发布 |
+
+校验失败时，响应中 `errors` 数组会列出**所有错误行号及原因**。
+
+### 冲突策略
+
+当导入的菜单日期在系统中已存在时，通过 `conflict_strategy` 参数控制处理方式：
+
+| 策略 | 说明 |
+|------|------|
+| `skip` | **跳过**冲突日期（默认），保留现有菜单 |
+| `update_draft` | 仅更新**草稿状态**的菜单；**已发布菜单会报错跳过** |
+| `report` | 仅检测并报告冲突，**不做任何修改** |
+
+> ⚠️ **安全提醒**：已发布的菜单永远不会被导入操作静默覆盖。即使使用 `update_draft` 策略，已发布菜单也会被跳过并在 `errors` 中给出原因。
+
+### 冲突结果查看
+
+导入响应结构：
+
+```json
+{
+  "success": true,
+  "total": 5,
+  "created": 3,
+  "updated": 1,
+  "skipped": 1,
+  "errors": ["供餐日期 2026-07-01 的菜单已发布，无法修改"],
+  "conflicts": [
+    {
+      "serving_date": "2026-07-01",
+      "existing_menu_id": 1,
+      "existing_menu_name": "周一午餐",
+      "existing_is_published": true,
+      "incoming_menu_name": "新周一午餐",
+      "incoming_is_published": false
+    }
+  ]
+}
+```
+
+#### 响应字段逐项解读：
+
+| 字段 | 含义 | 管理员该怎么看 |
+|------|------|----------------|
+| `success` | 导入是否成功（校验通过为 true） | 只要不是 `false` 就说明导入流程走完了，即使有部分跳过/冲突也是成功的 |
+| `total` | 导入文件中解析到的菜单总数 | 和你准备的菜单数量对比，确认没有漏读 |
+| `created` | 成功新建的菜单数 | 这些是全新的日期，之前系统中没有 |
+| `updated` | 成功更新的菜单数 | 只有 `update_draft` 策略下才会有值，表示草稿菜单被覆盖了 |
+| `skipped` | 跳过的菜单总数 | 包括：冲突跳过 + 已发布保护跳过 + 错误跳过 |
+| `errors` | 错误明细数组 | **逐条看**，每条都带行号/日期和具体原因 |
+| `conflicts` | 冲突明细数组 | **逐条核对**，每个冲突日期的新旧菜单信息都在这里 |
+
+#### `conflicts` 冲突明细逐项解读：
+
+| 字段 | 含义 | 该怎么处理 |
+|------|------|------------|
+| `serving_date` | 冲突的供餐日期 | 先看是哪一天的冲突 |
+| `existing_menu_id` | 系统中已有的菜单 ID | 可以调用 `/api/admin/menus/{id}` 查看现有详情 |
+| `existing_menu_name` | 系统中已有的菜单名称 | 确认是不是你想要保留的 |
+| `existing_is_published` | 现有菜单是否已发布 | `true`=已发布（受保护，无法修改），`false`=草稿（可更新） |
+| `incoming_menu_name` | 你导入文件中的菜单名称 | 确认是不是你想要的新名称 |
+| `incoming_is_published` | 你导入文件中的发布状态 | 确认你想设成什么状态 |
+
+#### 典型冲突场景解读：
+
+**场景 1：已发布菜单冲突**
+```json
+{
+  "serving_date": "2026-07-01",
+  "existing_menu_name": "周一午餐",
+  "existing_is_published": true,
+  "incoming_menu_name": "新周一午餐"
+}
+```
+> **解读**：7月1日已有已发布的"周一午餐"，导入的是"新周一午餐"。由于已发布，**任何策略都不会修改**，会出现在 `errors` 中。
+> **处理**：如果确实要改，先在系统里单独操作（不建议），或者确认导入文件里的日期是否正确。
+
+**场景 2：草稿菜单冲突（skip 策略）
+```json
+{
+  "serving_date": "2026-07-02",
+  "existing_menu_name": "周二午餐",
+  "existing_is_published": false,
+  "incoming_menu_name": "新周二午餐"
+}
+```
+> **解读**：7月2日有草稿状态的"周二午餐"，使用 `skip` 策略，所以**跳过不修改**，保留系统中的版本。
+> **处理**：如果想更新，改用 `update_draft` 策略重新导入。
+
+**场景 3：草稿菜单冲突（update_draft 策略）
+> 同样的冲突数据，使用 `update_draft` 策略时，`updated` 会 +1，冲突仍然出现在 `conflicts` 中但不会被跳过。
+
+### 服务端日志查看
+
+导入导出的每一步操作都会在服务端输出详细日志，包括：
+- 导入开始/结束、冲突检测结果、每一条菜单的处理动作（新建/更新/跳过）、字段校验错误详情
+
+启动服务时可以看到类似日志：
+```
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO - [JSON导入] 开始处理，冲突策略: skip
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO - [冲突检测] 发现 2 个日期冲突:
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO -   - 2026-07-01: 现有菜单='周一午餐'(已发布), 待导入='新周一午餐'
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO - [跳过] 供餐日期 2026-07-01 的菜单已发布，无法修改
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO - [新建] 2026-07-03: '周三午餐', 4 道菜品
+2026-06-19 10:30:00 - services.menu_import_export_service - INFO - [JSON导入] 完成: 总计=3, 新建=1, 更新=0, 跳过=2, 冲突=2
+```
+
+### 使用示例
+
+#### 1. 导入 JSON 菜单（skip 策略）
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/admin/menus/import/json?conflict_strategy=skip" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "name": "周一午餐",
+      "serving_date": "2026-07-01",
+      "deadline": "2026-07-01 09:00:00",
+      "items": [
+        {"name": "红烧肉", "price": 18, "stock": 50},
+        {"name": "米饭", "price": 2, "stock": 200}
+      ]
+    }
+  ]'
+```
+
+#### 2. 导入 CSV 菜单文件（update_draft 策略）
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/admin/menus/import/csv?conflict_strategy=update_draft" \
+  -F "file=@menus.csv"
+```
+
+#### 3. 预览冲突（不实际导入）
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/admin/menus/import/json?conflict_strategy=report" \
+  -H "Content-Type: application/json" \
+  -d '[{"name":"测试","serving_date":"2026-07-01","deadline":"2026-07-01 09:00:00","items":[{"name":"A","price":1,"stock":1}]}]'
+```
+
+#### 4. 导出全部菜单（JSON）
+
+```bash
+curl http://127.0.0.1:8000/api/admin/menus/export/json
+```
+
+#### 5. 导出指定日期范围菜单（CSV）
+
+```bash
+curl "http://127.0.0.1:8000/api/admin/menus/export/csv?start_date=2026-07-01&end_date=2026-07-07" \
+  -o week_menus.csv
+```
+
+#### 6. 导出后重启服务再导入（备份恢复流程）
+
+```bash
+# 第一步：导出备份
+curl http://127.0.0.1:8000/api/admin/menus/export/json > menu_backup.json
+
+# 第二步：服务重启后（如数据库重置），重新导入
+curl -X POST "http://127.0.0.1:8000/api/admin/menus/import/json?conflict_strategy=skip" \
+  -H "Content-Type: application/json" \
+  -d "$(cat menu_backup.json)"
+```
+
+### 对管理员操作的变化
+
+新增能力后，管理员的实际操作变化：
+
+1. **批量录入效率提升**：过去一周 5-7 天菜单需要逐天创建、逐个菜品添加，现在可以用 Excel/表格编辑好 CSV 一键导入，几分钟的工作缩短到几秒。
+2. **菜单可备份**：导出功能提供 JSON/CSV 两种格式备份，误操作或数据库重置后可以快速恢复。
+3. **冲突可控**：三种冲突策略（跳过/更新草稿/仅报告）满足不同场景需求，已发布菜单受保护不会被误改。
+4. **错误定位清晰**：校验失败返回行号+原因，对照 Excel 即可快速修正，无需逐行排查。
+
+### 运行导入导出测试
+
+```bash
+python test_menu_import_export.py
+```
+
+覆盖场景：
+- JSON/CSV 成功导入
+- 字段格式错误（含行号）
+- 同日期冲突的三种策略
+- 已发布菜单保护
+- JSON/CSV 导出
+- 导出-再导入数据一致性
+
 ## 核心流程示例
 
 ### 1. 发布菜单流程

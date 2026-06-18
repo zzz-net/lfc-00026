@@ -1,11 +1,14 @@
 import csv
 import io
 import json
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 from database import get_db, transaction, now_str
 from services.menu_service import MenuService
+
+logger = logging.getLogger(__name__)
 
 
 class MenuImportExportService:
@@ -261,7 +264,14 @@ class MenuImportExportService:
         with transaction() as conn:
             conflicts = MenuImportExportService._detect_conflicts(menus, conn)
 
+            if conflicts:
+                logger.info(f"[冲突检测] 发现 {len(conflicts)} 个日期冲突:")
+                for c in conflicts:
+                    status = "已发布" if c["existing_is_published"] else "草稿"
+                    logger.info(f"  - {c['serving_date']}: 现有菜单='{c['existing_menu_name']}'({status}), 待导入='{c['incoming_menu_name']}'")
+
             if conflict_strategy == "report":
+                logger.info(f"[冲突策略] report: 仅报告 {len(conflicts)} 个冲突，不做修改")
                 return {
                     "success": True,
                     "total": len(menus),
@@ -286,13 +296,14 @@ class MenuImportExportService:
                     conflict = conflict_map[serving_date]
 
                     if conflict["existing_is_published"]:
-                        import_errors.append(
-                            f"供餐日期 {serving_date} 的菜单已发布，无法修改"
-                        )
+                        err_msg = f"供餐日期 {serving_date} 的菜单已发布，无法修改"
+                        logger.warning(f"[跳过] {err_msg}")
+                        import_errors.append(err_msg)
                         skipped += 1
                         continue
 
                     if conflict_strategy == "skip":
+                        logger.info(f"[跳过] {serving_date}: 冲突策略=skip，保留现有菜单")
                         skipped += 1
                         continue
 
@@ -300,6 +311,7 @@ class MenuImportExportService:
                         try:
                             menu_id = conflict["existing_menu_id"]
                             now = now_str()
+                            logger.info(f"[更新草稿] {serving_date}: '{conflict['existing_menu_name']}' -> '{menu_data['name']}'")
                             conn.execute(
                                 "UPDATE menus SET name = ?, deadline = ?, is_published = ?, updated_at = ? WHERE id = ?",
                                 (menu_data["name"], menu_data["deadline"],
@@ -314,13 +326,16 @@ class MenuImportExportService:
                                 )
                             updated += 1
                         except Exception as e:
-                            import_errors.append(f"更新菜单 {serving_date} 失败: {str(e)}")
+                            err_msg = f"更新菜单 {serving_date} 失败: {str(e)}"
+                            logger.error(f"[更新失败] {err_msg}")
+                            import_errors.append(err_msg)
                             skipped += 1
                         continue
                 else:
                     try:
                         now = now_str()
                         cur = conn.cursor()
+                        logger.info(f"[新建] {serving_date}: '{menu_data['name']}', {len(menu_data['items'])} 道菜品")
                         cur.execute(
                             """INSERT INTO menus (name, serving_date, deadline, is_published, created_at, updated_at)
                                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -336,7 +351,9 @@ class MenuImportExportService:
                             )
                         created += 1
                     except Exception as e:
-                        import_errors.append(f"创建菜单 {serving_date} 失败: {str(e)}")
+                        err_msg = f"创建菜单 {serving_date} 失败: {str(e)}"
+                        logger.error(f"[创建失败] {err_msg}")
+                        import_errors.append(err_msg)
                         skipped += 1
 
             return {
@@ -351,8 +368,12 @@ class MenuImportExportService:
 
     @staticmethod
     def import_menus_from_json(json_data: Any, conflict_strategy: str = "skip") -> Dict[str, Any]:
+        logger.info(f"[JSON导入] 开始处理，冲突策略: {conflict_strategy}")
         menus, parse_errors = MenuImportExportService._parse_json_data(json_data)
         if parse_errors:
+            logger.warning(f"[JSON导入] 字段校验失败，共 {len(parse_errors)} 条错误")
+            for err in parse_errors:
+                logger.warning(f"  - {err}")
             return {
                 "success": False,
                 "total": 0,
@@ -362,12 +383,19 @@ class MenuImportExportService:
                 "errors": parse_errors,
                 "conflicts": [],
             }
-        return MenuImportExportService.import_menus(menus, conflict_strategy)
+        logger.info(f"[JSON导入] 解析完成，有效菜单 {len(menus)} 个")
+        result = MenuImportExportService.import_menus(menus, conflict_strategy)
+        logger.info(f"[JSON导入] 完成: 总计={result['total']}, 新建={result['created']}, 更新={result['updated']}, 跳过={result['skipped']}, 冲突={len(result['conflicts'])}")
+        return result
 
     @staticmethod
     def import_menus_from_csv(csv_content: str, conflict_strategy: str = "skip") -> Dict[str, Any]:
+        logger.info(f"[CSV导入] 开始处理，冲突策略: {conflict_strategy}")
         menus, parse_errors = MenuImportExportService._parse_csv_data(csv_content)
         if parse_errors:
+            logger.warning(f"[CSV导入] 字段校验失败，共 {len(parse_errors)} 条错误")
+            for err in parse_errors:
+                logger.warning(f"  - {err}")
             return {
                 "success": False,
                 "total": 0,
@@ -377,13 +405,17 @@ class MenuImportExportService:
                 "errors": parse_errors,
                 "conflicts": [],
             }
-        return MenuImportExportService.import_menus(menus, conflict_strategy)
+        logger.info(f"[CSV导入] 解析完成，有效菜单 {len(menus)} 个")
+        result = MenuImportExportService.import_menus(menus, conflict_strategy)
+        logger.info(f"[CSV导入] 完成: 总计={result['total']}, 新建={result['created']}, 更新={result['updated']}, 跳过={result['skipped']}, 冲突={len(result['conflicts'])}")
+        return result
 
     @staticmethod
     def export_menus_json(
         start_date: str = None,
         end_date: str = None,
     ) -> List[Dict[str, Any]]:
+        logger.info(f"[JSON导出] 开始导出，范围: {start_date or '不限'} ~ {end_date or '不限'}")
         conn = get_db()
         query = "SELECT * FROM menus WHERE 1=1"
         params = []
@@ -405,7 +437,10 @@ class MenuImportExportService:
             ).fetchall()
             menu["items"] = [dict(i) for i in items]
             menu["is_published"] = bool(menu["is_published"])
+            status = "已发布" if menu["is_published"] else "草稿"
+            logger.info(f"  - {menu['serving_date']}: '{menu['name']}'({status}), {len(menu['items'])} 道菜品")
             result.append(menu)
+        logger.info(f"[JSON导出] 完成，共导出 {len(result)} 个菜单")
         return result
 
     @staticmethod
@@ -413,13 +448,15 @@ class MenuImportExportService:
         start_date: str = None,
         end_date: str = None,
     ) -> str:
+        logger.info(f"[CSV导出] 开始导出，范围: {start_date or '不限'} ~ {end_date or '不限'}")
         menus = MenuImportExportService.export_menus_json(start_date, end_date)
-        output = io.StringIO()
-        writer = csv.writer(output)
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\n")
         writer.writerow([
             "serving_date", "menu_name", "deadline", "is_published",
             "item_name", "price", "stock", "sold_count",
         ])
+        total_items = 0
         for menu in menus:
             published_str = "1" if menu["is_published"] else "0"
             for item in menu["items"]:
@@ -433,4 +470,7 @@ class MenuImportExportService:
                     item["stock"],
                     item["sold_count"],
                 ])
-        return output.getvalue()
+            total_items += len(menu["items"])
+        csv_content = output.getvalue()
+        logger.info(f"[CSV导出] 完成，共 {len(menus)} 个菜单，{total_items} 道菜品")
+        return csv_content

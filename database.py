@@ -1,10 +1,15 @@
 import sqlite3
 import threading
+import os
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "canteen.db"
+_env_db_path = os.environ.get("CANTEEN_DB_PATH")
+if _env_db_path:
+    DB_PATH = Path(_env_db_path)
+else:
+    DB_PATH = Path(__file__).parent / "canteen.db"
 
 _local = threading.local()
 
