@@ -1,0 +1,233 @@
+# 食堂订餐扣费后端服务
+
+本地轻量级食堂订餐扣费系统，使用 FastAPI + SQLite 构建。
+
+## 功能特性
+
+- **菜单管理**：管理员配置菜单、菜品、库存、订餐截止时间
+- **账户管理**：员工初始余额、余额调整
+- **下单冻结**：员工下单时冻结对应金额余额
+- **取餐结算**：取餐后扣减余额，完成结算
+- **取消退款**：截止时间前可取消订单，释放冻结金额
+- **流水记录**：每一步操作都写入流水，可追溯、可导出CSV
+- **幂等性保证**：支持幂等键，重复请求返回相同结果
+- **并发安全**：基于数据库事务，避免并发重复扣款
+- **数据一致性**：服务重启后自动对账，订单/余额/库存/流水一致
+
+## 快速开始
+
+### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 启动服务
+
+```bash
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+服务启动后访问：
+- API 文档（Swagger UI）：http://127.0.0.1:8000/docs
+- 健康检查：http://127.0.0.1:8000/api/health
+
+### 3. 初始化示例数据
+
+调用初始化接口，会创建3个员工、1个含5道菜品的菜单并发布：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/init-sample
+```
+
+或者运行完整测试脚本：
+
+```bash
+python test_api.py
+```
+
+## 数据模型
+
+### 员工表 (employees)
+- `id`：员工ID（主键）
+- `name`：姓名
+- `balance`：账户余额
+- `frozen_balance`：冻结余额（已下单未取餐）
+
+### 菜单表 (menus)
+- `id`：菜单ID
+- `name`：菜单名称
+- `serving_date`：供餐日期
+- `deadline`：订餐截止时间
+- `is_published`：是否发布
+
+### 菜单项表 (menu_items)
+- `id`：菜品ID
+- `menu_id`：所属菜单ID
+- `name`：菜品名称
+- `price`：价格
+- `stock`：库存
+- `sold_count`：已售数量
+
+### 订单表 (orders)
+- `id`：订单号
+- `idempotency_key`：幂等键（唯一）
+- `employee_id`：员工ID
+- `menu_item_id`：菜品ID
+- `status`：状态（pending/taken/cancelled）
+- `total_amount`：订单金额
+
+### 流水表 (transactions)
+- `id`：流水ID
+- `type`：类型（INITIAL/ADJUST/FREEZE/SETTLE/UNFREEZE）
+- `employee_id`：员工ID
+- `order_id`：订单ID
+- `amount`：金额
+- `balance_before/after`：变动前后余额
+- `frozen_before/after`：变动前后冻结金额
+- `idempotency_key`：幂等键
+
+## API 列表
+
+### 管理员接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | /api/admin/employees | 创建员工 |
+| GET | /api/admin/employees | 员工列表 |
+| GET | /api/admin/employees/{id} | 员工详情 |
+| POST | /api/admin/employees/{id}/adjust | 调整余额 |
+| POST | /api/admin/menus | 创建菜单 |
+| GET | /api/admin/menus | 菜单列表 |
+| GET | /api/admin/menus/{id} | 菜单详情 |
+| POST | /api/admin/menus/{id}/items | 添加菜品 |
+| PATCH | /api/admin/menu-items/{id} | 更新菜品 |
+| POST | /api/admin/menus/{id}/publish | 发布菜单 |
+| GET | /api/admin/reconciliation | 对账检查 |
+
+### 员工端接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/menus | 已发布菜单列表 |
+| GET | /api/menus/{id} | 菜单详情 |
+| POST | /api/orders | 下单（冻结余额） |
+| GET | /api/orders | 订单列表 |
+| GET | /api/orders/{id} | 订单详情 |
+| POST | /api/orders/{id}/take | 取餐结算 |
+| POST | /api/orders/{id}/cancel | 取消订单 |
+
+### 流水接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/transactions | 查询流水 |
+| GET | /api/transactions/export | 导出CSV |
+
+## 错误码说明
+
+| 错误码 | 说明 |
+|--------|------|
+| EMPLOYEE_EXISTS | 员工ID已存在 |
+| EMPLOYEE_NOT_FOUND | 员工不存在 |
+| INSUFFICIENT_BALANCE | 余额不足 |
+| MENU_NOT_FOUND | 菜单不存在 |
+| MENU_NOT_PUBLISHED | 菜单未发布 |
+| OUT_OF_STOCK | 库存不足 |
+| DEADLINE_PASSED | 已过截止时间 |
+| ORDER_NOT_FOUND | 订单不存在 |
+| ORDER_STATUS_ERROR | 订单状态不允许操作 |
+| ALREADY_TAKEN | 已取餐，无法取消 |
+
+## 核心流程示例
+
+### 1. 发布菜单流程
+
+```bash
+# 创建菜单
+curl -X POST http://127.0.0.1:8000/api/admin/menus \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "周一午餐",
+    "serving_date": "2026-06-20",
+    "deadline": "2026-06-19 18:00:00"
+  }'
+
+# 添加菜品
+curl -X POST http://127.0.0.1:8000/api/admin/menus/1/items \
+  -H "Content-Type: application/json" \
+  -d '{"name": "红烧肉", "price": 18.0, "stock": 50}'
+
+# 发布菜单
+curl -X POST http://127.0.0.1:8000/api/admin/menus/1/publish
+```
+
+### 2. 员工下单流程
+
+```bash
+# 下单（带幂等键）
+curl -X POST http://127.0.0.1:8000/api/orders \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: my-unique-key-001" \
+  -d '{
+    "employee_id": "EMP001",
+    "menu_item_id": 1,
+    "quantity": 2
+  }'
+```
+
+### 3. 取餐结算
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/orders/ORD12345678/take
+```
+
+### 4. 取消订单
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/orders/ORD12345678/cancel
+```
+
+### 5. 流水导出
+
+```bash
+curl http://127.0.0.1:8000/api/transactions/export -o transactions.csv
+```
+
+## 对账与一致性
+
+服务启动后可随时调用对账接口检查数据一致性：
+
+```bash
+curl http://127.0.0.1:8000/api/admin/reconciliation
+```
+
+对账检查项：
+- 员工余额与流水末尾是否一致
+- 员工冻结金额与待结算订单总额是否一致
+- 菜品已售数量是否在合理范围内（不超过库存、不为负）
+- 订单对应流水是否完整
+
+## 并发安全
+
+- 使用 SQLite 的 `BEGIN IMMEDIATE` 事务保证写操作串行化
+- 幂等键唯一索引防止重复下单
+- 余额冻结/扣减在同一事务中完成
+- 库存扣减与订单创建原子化
+
+## 项目结构
+
+```
+.
+├── main.py                  # 主应用和API层
+├── database.py              # 数据库连接和表结构
+├── services/
+│   ├── __init__.py
+│   ├── employee_service.py  # 员工账户服务
+│   ├── menu_service.py      # 菜单服务
+│   ├── order_service.py     # 订单服务
+│   └── transaction_service.py # 流水和对账服务
+├── test_api.py              # API测试脚本
+├── requirements.txt         # 依赖列表
+└── canteen.db              # SQLite数据库（运行后生成）
+```
