@@ -81,9 +81,12 @@ class ConfigService:
 
     @staticmethod
     def get_makeup_config(conn=None) -> Dict[str, Any]:
+        allow_revoke_val = ConfigService.get_config("makeup_allow_revoke", conn) or "true"
         return {
             "days_limit": ConfigService.get_config_int("makeup_days_limit", 7, conn),
             "default_source": ConfigService.get_config("makeup_default_source", conn) or "window",
             "allowed_sources": ConfigService.get_config_list("makeup_allowed_sources", ",", conn),
             "default_remark": ConfigService.get_config("makeup_default_remark", conn) or "线下窗口补录",
+            "allow_revoke": allow_revoke_val.lower() in ("true", "1", "yes"),
+            "revoke_deadline_hours": ConfigService.get_config_int("makeup_revoke_deadline_hours", 24, conn),
         }

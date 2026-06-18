@@ -82,6 +82,10 @@ class MakeupOrderCreate(BaseModel):
     remark: Optional[str] = None
 
 
+class MakeupRevokeRequest(BaseModel):
+    remark: Optional[str] = None
+
+
 class ConfigUpdate(BaseModel):
     value: str
     description: Optional[str] = None
@@ -286,6 +290,56 @@ def admin_makeup_order(
             error_response(msg, "INVALID_QUANTITY", 400)
         else:
             error_response(msg, "MAKEUP_ERROR", 400)
+
+
+@app.get("/api/admin/orders/makeup", tags=["管理员"], summary="查询补录记录")
+def admin_query_makeup_orders(
+    employee_id: Optional[str] = Query(None, description="员工ID"),
+    serving_date: Optional[str] = Query(None, description="供餐日期 YYYY-MM-DD"),
+    source: Optional[str] = Query(None, description="补录来源"),
+    operation_time_start: Optional[str] = Query(None, description="操作时间起 YYYY-MM-DD HH:MM:SS"),
+    operation_time_end: Optional[str] = Query(None, description="操作时间止 YYYY-MM-DD HH:MM:SS"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+):
+    try:
+        return OrderService.query_makeup_orders(
+            employee_id=employee_id,
+            serving_date=serving_date,
+            source=source,
+            operation_time_start=operation_time_start,
+            operation_time_end=operation_time_end,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as e:
+        error_response(str(e), "MAKEUP_QUERY_ERROR", 400)
+
+
+@app.post("/api/admin/orders/makeup/{order_id}/revoke", tags=["管理员"], summary="撤销补录")
+def admin_revoke_makeup_order(order_id: str, data: MakeupRevokeRequest = None):
+    remark = data.remark if data else None
+    try:
+        result = OrderService.revoke_makeup_order(order_id, remark=remark)
+        return result
+    except ValueError as e:
+        msg = str(e)
+        if "不存在" in msg:
+            error_response(msg, "ORDER_NOT_FOUND", 404)
+        elif "已被撤销" in msg or "重复操作" in msg:
+            error_response(msg, "ALREADY_REVOKED", 409)
+        elif "非补录来源" in msg:
+            error_response(msg, "NOT_MAKEUP_ORDER", 400)
+        elif "不允许撤销" in msg and "配置" in msg:
+            error_response(msg, "REVOKE_NOT_ALLOWED", 403)
+        elif "超过" in msg and "小时" in msg:
+            error_response(msg, "REVOKE_DEADLINE_EXCEEDED", 400)
+        elif "已处于取消状态" in msg:
+            error_response(msg, "ORDER_ALREADY_CANCELLED", 409)
+        elif "只能撤销已取餐" in msg or "当前状态为" in msg:
+            error_response(msg, "ORDER_STATUS_ERROR", 400)
+        else:
+            error_response(msg, "REVOKE_ERROR", 400)
 
 
 # ========== 管理员 - 配置管理 ==========

@@ -575,6 +575,7 @@ curl -X PUT http://127.0.0.1:8000/api/admin/config/makeup_days_limit \
 
 ### 调用补录接口
 
+补录请求示例：
 ```bash
 curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
   -H "Content-Type: application/json" \
@@ -587,6 +588,94 @@ curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
     "source": "window",
     "remark": "窗口补录-张三"
   }'
+```
+
+成功响应示例（实际 curl 输出）：
+```json
+{
+  "id": "ORD1781816702ABC12345",
+  "employee_id": "EMP001",
+  "menu_id": 1,
+  "menu_item_id": 1,
+  "item_name": "红烧肉",
+  "price": 18.0,
+  "quantity": 2,
+  "total_amount": 36.0,
+  "status": "taken",
+  "source": "makeup",
+  "makeup_remark": "窗口补录-张三",
+  "created_at": "2026-06-19 12:00:00",
+  "updated_at": "2026-06-19 12:00:00"
+}
+```
+
+### 常见失败响应示例
+
+#### 1. 重复补录冲突（DUPLICATE_MAKEUP）
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "employee_id": "EMP001",
+    "menu_item_id": 1,
+    "quantity": 1,
+    "serving_date": "2026-06-19"
+  }'
+```
+
+响应：
+```json
+{
+  "detail": {
+    "code": "DUPLICATE_MAKEUP",
+    "message": "该员工在 2026-06-19 已补录过 红烧肉，请勿重复补录"
+  }
+}
+```
+
+#### 2. 超出补录天数限制（DATE_OUT_OF_RANGE）
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "employee_id": "EMP001",
+    "menu_item_id": 1,
+    "quantity": 1,
+    "serving_date": "2026-06-01"
+  }'
+```
+
+响应（假设 makeup_days_limit=7）：
+```json
+{
+  "detail": {
+    "code": "DATE_OUT_OF_RANGE",
+    "message": "补录日期超出允许范围，最多允许补录 7 天内的记录，当前已过 18 天"
+  }
+}
+```
+
+#### 3. 补录来源不合法（INVALID_SOURCE）
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "employee_id": "EMP001",
+    "menu_item_id": 1,
+    "quantity": 1,
+    "serving_date": "2026-06-19",
+    "source": "unknown_source"
+  }'
+```
+
+响应：
+```json
+{
+  "detail": {
+    "code": "INVALID_SOURCE",
+    "message": "补录来源 'unknown_source' 不合法，允许的来源: window, admin, manual"
+  }
+}
 ```
 
 ### 请求字段说明

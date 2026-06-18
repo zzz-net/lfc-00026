@@ -73,6 +73,7 @@ class TransactionService:
             "FREEZE": "下单冻结",
             "SETTLE": "取餐结算",
             "UNFREEZE": "取消解冻",
+            "MAKEUP_REVOKE": "撤销补录退款",
         }
 
         for txn in result["items"]:

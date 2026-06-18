@@ -108,6 +108,16 @@ def init_db():
         created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS makeup_operation_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT NOT NULL,
+        operation_type TEXT NOT NULL,
+        operator TEXT,
+        remark TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(id)
+    );
+
     CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -123,10 +133,16 @@ def init_db():
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_makeup_unique 
         ON orders(employee_id, menu_id, menu_item_id, status) 
         WHERE status = 'taken' AND source = 'makeup';
+    CREATE INDEX IF NOT EXISTS idx_orders_makeup_query 
+        ON orders(employee_id, source, created_at);
+    CREATE INDEX IF NOT EXISTS idx_makeup_log_order ON makeup_operation_log(order_id);
+    CREATE INDEX IF NOT EXISTS idx_makeup_log_type ON makeup_operation_log(operation_type);
+    CREATE INDEX IF NOT EXISTS idx_makeup_log_created ON makeup_operation_log(created_at);
     """)
 
     _add_column_if_not_exists(cur, "orders", "source", "TEXT NOT NULL DEFAULT 'normal'")
     _add_column_if_not_exists(cur, "orders", "makeup_remark", "TEXT")
+    _add_column_if_not_exists(cur, "orders", "revoked_at", "TEXT")
 
     _init_default_config(cur)
 
@@ -139,6 +155,8 @@ def _init_default_config(cur):
         ("makeup_default_source", "window", "补录默认来源标识"),
         ("makeup_allowed_sources", "window,admin,manual", "允许的补录来源列表，逗号分隔"),
         ("makeup_default_remark", "线下窗口补录", "补录默认备注"),
+        ("makeup_allow_revoke", "true", "是否允许撤销补录"),
+        ("makeup_revoke_deadline_hours", "24", "补录后允许撤销的小时数"),
     ]
     now = now_str()
     for key, value, desc in defaults:
