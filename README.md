@@ -215,6 +215,63 @@ curl http://127.0.0.1:8000/api/admin/reconciliation
 - 余额冻结/扣减在同一事务中完成
 - 库存扣减与订单创建原子化
 
+## 运行时生成文件与提交隔离
+
+服务运行后，项目根目录会产生以下本地文件。**它们全部被 `.gitignore` 忽略，不会进入版本提交。**
+
+### SQLite 数据库文件
+
+| 文件 | 何时产生 | 服务停止后 | 删除后果 | `.gitignore` 规则 |
+|------|----------|-----------|----------|-------------------|
+| `canteen.db` | 首次启动时自动创建 | **保留**，含全部业务数据 | 丢失所有本地数据，重启后从空库开始 | `*.db` |
+| `canteen.db-wal` | WAL 模式下有写操作时产生 | 正常关闭后自动回收为空或消失；异常退出可能残留 | 无影响，内容已合并到主库 | `*.db-wal` |
+| `canteen.db-shm` | WAL 模式下有并发读时产生 | 正常关闭后自动删除；异常退出可能残留 | 无影响，仅索引辅助 | `*.db-shm` |
+
+> SQLite 启用了 WAL（Write-Ahead Logging）模式（见 [database.py](file:///d:/workSpace/AI__SPACE/lfc-00026/database.py#L17)）。`-wal` 和 `-shm` 是该模式的运行时分片，正常关闭时 SQLite 会自动清理；若服务被强杀，残留的 `-wal` / `-shm` 文件会在下次启动时被 SQLite 自行处理，无需手动干预。
+
+### 其他运行时产物
+
+| 文件/目录 | 何时产生 | `.gitignore` 规则 |
+|-----------|----------|-------------------|
+| `__pycache__/` | Python 解释器导入模块时自动生成 | `__pycache__/` |
+| `*.log` | 本服务默认不写日志文件；若用户重定向输出则可能产生 | `*.log` |
+
+### 清理方式
+
+删除数据库文件将**丢失所有本地测试数据**（员工余额、订单、流水等），重启后从空库开始。如需重置：
+
+```bash
+# 先停止服务，再删除数据库文件
+# Linux / macOS
+rm -f canteen.db canteen.db-wal canteen.db-shm
+
+# Windows PowerShell
+Remove-Item canteen.db, canteen.db-wal, canteen.db-shm -ErrorAction SilentlyContinue
+
+# 重新启动后会自动创建空库
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+仅清理缓存，不影响数据：
+
+```bash
+# Linux / macOS
+rm -rf __pycache__ services/__pycache__
+
+# Windows PowerShell
+Remove-Item __pycache__, services\__pycache__ -Recurse -ErrorAction SilentlyContinue
+```
+
+### 确认运行态产物不会误入提交
+
+```bash
+# 查看被忽略的文件（!! 标记）
+git status --short --ignored
+
+# 逐一验证忽略规则命中
+git check-ignore -v canteen.db canteen.db-wal canteen.db-shm
+```
+
 ## 项目结构
 
 ```
@@ -229,5 +286,7 @@ curl http://127.0.0.1:8000/api/admin/reconciliation
 │   └── transaction_service.py # 流水和对账服务
 ├── test_api.py              # API测试脚本
 ├── requirements.txt         # 依赖列表
-└── canteen.db              # SQLite数据库（运行后生成）
+├── canteen.db               # (运行时生成，不提交)
+├── canteen.db-wal           # (运行时生成，不提交)
+└── canteen.db-shm           # (运行时生成，不提交)
 ```
