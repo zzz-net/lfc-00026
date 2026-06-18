@@ -602,7 +602,7 @@ curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
   "quantity": 2,
   "total_amount": 36.0,
   "status": "taken",
-  "source": "makeup",
+  "source": "window",
   "makeup_remark": "窗口补录-张三",
   "created_at": "2026-06-19 12:00:00",
   "updated_at": "2026-06-19 12:00:00"

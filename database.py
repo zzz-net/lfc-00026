@@ -125,7 +125,15 @@ def init_db():
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    """)
 
+    _add_column_if_not_exists(cur, "orders", "source", "TEXT NOT NULL DEFAULT 'normal'")
+    _add_column_if_not_exists(cur, "orders", "makeup_remark", "TEXT")
+    _add_column_if_not_exists(cur, "orders", "revoked_at", "TEXT")
+
+    _migrate_makeup_unique_index(cur)
+
+    cur.executescript("""
     CREATE INDEX IF NOT EXISTS idx_transactions_employee ON transactions(employee_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_order ON transactions(order_id);
     CREATE INDEX IF NOT EXISTS idx_orders_employee ON orders(employee_id);
@@ -139,12 +147,6 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_makeup_log_type ON makeup_operation_log(operation_type);
     CREATE INDEX IF NOT EXISTS idx_makeup_log_created ON makeup_operation_log(created_at);
     """)
-
-    _add_column_if_not_exists(cur, "orders", "source", "TEXT NOT NULL DEFAULT 'normal'")
-    _add_column_if_not_exists(cur, "orders", "makeup_remark", "TEXT")
-    _add_column_if_not_exists(cur, "orders", "revoked_at", "TEXT")
-
-    _migrate_makeup_unique_index(cur)
 
     _init_default_config(cur)
 
