@@ -93,7 +93,7 @@ def build_sample_csv(menus):
     return output.getvalue()
 
 
-def test_json_import_success():
+def check_json_import_success():
     print_section("测试 1: JSON 格式成功导入")
     start = _date(0)
     menus = build_sample_menus(start, 3, published=False)
@@ -107,7 +107,7 @@ def test_json_import_success():
     print("  [PASS] JSON 导入成功")
 
 
-def test_csv_import_success():
+def check_csv_import_success():
     print_section("测试 2: CSV 格式成功导入")
     start = _date(10)
     menus = build_sample_menus(start, 2, published=False)
@@ -122,7 +122,7 @@ def test_csv_import_success():
     print("  [PASS] CSV 导入成功")
 
 
-def test_field_validation_errors():
+def check_field_validation_errors():
     print_section("测试 3: 字段错误校验（带行号和原因）")
     bad_menus = [
         {
@@ -148,7 +148,7 @@ def test_field_validation_errors():
     print("  [PASS] 字段校验正确，返回了详细错误")
 
 
-def test_conflict_skip_strategy():
+def check_conflict_skip_strategy():
     print_section("测试 4: 同日期冲突 - skip 策略")
     start = _date(0)
     menus = build_sample_menus(start, 3, published=False)
@@ -162,7 +162,7 @@ def test_conflict_skip_strategy():
     print("  [PASS] skip 策略正确")
 
 
-def test_conflict_report_strategy():
+def check_conflict_report_strategy():
     print_section("测试 5: 同日期冲突 - report 策略（仅报告，不修改）")
     start = _date(0)
     menus = build_sample_menus(start, 3, published=False)
@@ -183,7 +183,7 @@ def test_conflict_report_strategy():
     print("  [PASS] report 策略正确，仅报告不修改")
 
 
-def test_conflict_update_draft_strategy():
+def check_conflict_update_draft_strategy():
     print_section("测试 6: 同日期冲突 - update_draft 策略（更新草稿菜单）")
     start = _date(10)
     menus = build_sample_menus(start, 2, published=False)
@@ -205,7 +205,7 @@ def test_conflict_update_draft_strategy():
     print("  [PASS] update_draft 策略正确，草稿菜单已更新")
 
 
-def test_published_menu_protection():
+def check_published_menu_protection():
     print_section("测试 7: 已发布菜单不能被修改")
     start = _date(20)
     menus = build_sample_menus(start, 1, published=True)
@@ -227,7 +227,7 @@ def test_published_menu_protection():
     print("  [PASS] 已发布菜单保护正确，无法被静默修改")
 
 
-def test_export_json():
+def check_export_json():
     print_section("测试 8: JSON 格式导出")
     r = api("GET", "/api/admin/menus/export/json", params={"start_date": "2026-07-01", "end_date": "2026-07-05"})
     data = r.json()
@@ -243,7 +243,7 @@ def test_export_json():
     print("  [PASS] JSON 导出成功")
 
 
-def test_export_csv():
+def check_export_csv():
     print_section("测试 9: CSV 格式导出")
     r = api("GET", "/api/admin/menus/export/csv", params={"start_date": "2026-07-01", "end_date": "2026-07-05"})
     content = r.text
@@ -259,7 +259,7 @@ def test_export_csv():
     print("  [PASS] CSV 导出成功")
 
 
-def test_export_import_roundtrip():
+def check_export_import_roundtrip():
     print_section("测试 10: 导出后再导入一致性（往返验证）")
     src_start = _date(0)
     src_end = _date(2)
@@ -318,7 +318,7 @@ def test_export_import_roundtrip():
     print("  [PASS] 导出-导入往返一致，数据完整无丢失")
 
 
-def test_csv_field_errors():
+def check_csv_field_errors():
     print_section("测试 11: CSV 字段错误（带行号）")
     bad_csv = """serving_date,menu_name,deadline,is_published,item_name,price,stock
 bad-date,周一午餐,2026-08-01 09:00:00,0,红烧肉,abc,50
@@ -362,17 +362,17 @@ def main():
 
     all_passed = True
     tests = [
-        test_json_import_success,
-        test_csv_import_success,
-        test_field_validation_errors,
-        test_conflict_skip_strategy,
-        test_conflict_report_strategy,
-        test_conflict_update_draft_strategy,
-        test_published_menu_protection,
-        test_export_json,
-        test_export_csv,
-        test_export_import_roundtrip,
-        test_csv_field_errors,
+        check_json_import_success,
+        check_csv_import_success,
+        check_field_validation_errors,
+        check_conflict_skip_strategy,
+        check_conflict_report_strategy,
+        check_conflict_update_draft_strategy,
+        check_published_menu_protection,
+        check_export_json,
+        check_export_csv,
+        check_export_import_roundtrip,
+        check_csv_field_errors,
     ]
 
     passed = 0

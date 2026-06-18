@@ -522,6 +522,166 @@ python test_menu_import_export.py
 - JSON/CSV 导出
 - 导出-再导入数据一致性
 
+## 管理员补录取餐
+
+线下窗口偶尔会出现"先发餐、后录系统"的情况，管理员可以通过补录接口登记取餐记录。补录走完整的订单流程（冻结+结算），确保余额、库存、流水、对账完全一致。
+
+### 适用场景
+- 窗口网络故障，员工先取餐，过后补录
+- 系统异常导致取餐记录丢失，管理员手动补录
+- 特殊情况需要人工登记取餐
+
+### 补录流程
+
+补录接口会在一个数据库事务中完成以下操作：
+1. 检查补录配置（天数限制、来源合法性）
+2. 检查日期合法性（日期格式、日期范围、菜单日期匹配）
+3. 检查重复补录（同一员工+同一菜单+同一菜品+已取餐状态）
+4. 检查菜单已发布
+5. 检查库存充足
+6. 检查余额充足
+7. 冻结余额（同正常下单）
+8. 扣减库存（sold_count + 增加已售数量）
+9. 创建订单（pending → taken）
+10. 扣减余额、解冻（实际结算）
+11. 写入 FREEZE 和 SETTLE 两条流水
+12. 订单状态转为 taken
+
+### 可配置项
+
+所有配置存储在数据库的 `config` 表中，重启后保持不变。
+
+| 配置键 | 默认值 | 说明 |
+|--------|--------|------|
+| `makeup_days_limit` | `7` | 允许补录的最大天数（向前追溯） |
+| `makeup_default_source` | `window` | 默认补录来源 |
+| `makeup_allowed_sources` | `window,admin,manual` | 允许的补录来源列表 |
+| `makeup_default_remark` | `线下窗口补录` | 默认备注 |
+
+### 查看和修改配置
+
+```bash
+# 查看所有配置
+curl http://127.0.0.1:8000/api/admin/config
+
+# 查看补录相关配置
+curl http://127.0.0.1:8000/api/admin/config/makeup
+
+# 修改配置（例如将补录天数改为 30 天）
+curl -X PUT http://127.0.0.1:8000/api/admin/config/makeup_days_limit \
+  -H "Content-Type: application/json" \
+  -d '{"value": "30", "description": "补录允许的最大天数"}'
+```
+
+### 调用补录接口
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: makeup-20260619-emp001-item1" \
+  -d '{
+    "employee_id": "EMP001",
+    "menu_item_id": 1,
+    "quantity": 2,
+    "serving_date": "2026-06-19",
+    "source": "window",
+    "remark": "窗口补录-张三"
+  }'
+```
+
+### 请求字段说明
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `employee_id` | 是 | 员工ID |
+| `menu_item_id` | 是 | 菜品ID |
+| `quantity` | 是 | 数量，必须大于0 |
+| `serving_date` | 是 | 供餐日期，格式 YYYY-MM-DD |
+| `source` | 否 | 补录来源，必须在允许的来源列表中 |
+| `remark` | 否 | 补录备注 |
+
+### 成功响应
+
+```json
+{
+  "id": "ORD1781816702ABC12345",
+  "employee_id": "EMP001",
+  "menu_item_id": 1,
+  "item_name": "红烧肉",
+  "price": 18.0,
+  "quantity": 2,
+  "total_amount": 36.0,
+  "status": "taken",
+  "source": "makeup",
+  "makeup_remark": "窗口补录-张三",
+  "created_at": "2026-06-19 12:00:00",
+  "updated_at": "2026-06-19 12:00:00"
+}
+```
+
+### 失败时怎么看结果
+
+所有错误响应格式统一为：
+```json
+{
+  "detail": {
+    "code": "错误码",
+    "message": "详细错误信息"
+  }
+}
+```
+
+**常见错误及处理：**
+
+| 错误码 | HTTP状态 | 原因 | 处理方式 |
+|---------|----------|------|----------|
+| `DUPLICATE_MAKEUP` | 409 | 该员工该日期该菜品已补录过 | 确认是否真的需要补录；或查询订单列表确认 |
+| `INSUFFICIENT_BALANCE` | 400 | 员工余额不足 | 先给员工充值，或确认员工ID是否正确 |
+| `OUT_OF_STOCK` | 400 | 库存不足 | 先增加菜品库存，或确认菜品ID是否正确 |
+| `MENU_NOT_PUBLISHED` | 400 | 菜单未发布 | 先发布菜单 |
+| `DATE_MISMATCH` | 400 | 补录日期与菜品所属菜单日期不匹配 | 检查菜品所属菜单日期，或修改补录日期 |
+| `DATE_OUT_OF_RANGE` | 400 | 超出补录天数范围 | 修改配置 `makeup_days_limit` 调大天数，或确认日期是否正确 |
+| `INVALID_SOURCE` | 400 | 补录来源不合法 | 使用允许的来源，或在配置中添加 |
+| `INVALID_DATE_FORMAT` | 400 | 日期格式错误 | 使用 YYYY-MM-DD 格式 |
+
+### 服务端日志
+
+补录的每一步都会在服务端输出详细日志，包括：
+- 补录开始、配置读取、冲突检测、库存/余额检查、成功/失败结果
+
+启动服务时可以看到类似日志：
+```
+2026-06-19 12:00:00 - services.order_service - INFO - [补录] 开始处理: 员工=EMP001, 菜品=1, 数量=2, 日期=2026-06-19, 来源=window, 日期差=0天
+2026-06-19 12:00:01 - services.order_service - INFO - [补录] 成功: 订单=ORD..., 员工=EMP001, 菜品=红烧肉, 数量=2, 金额=36.0, 来源=window
+```
+
+冲突时日志示例：
+```
+2026-06-19 12:00:00 - services.order_service - WARNING - [补录] 重复补录检测: 员工=EMP001, menu_id=1, menu_item_id=1 已存在补录订单 ORD...
+2026-06-19 12:00:00 - services.order_service - WARNING - [补录] 库存不足: 菜品=红烧肉, 库存=50, 已售=49, 可用=1, 请求=2
+```
+
+### 幂等性
+
+补录接口支持 `X-Idempotency-Key` 请求头，使用相同的幂等键重复请求会返回同一结果，不会重复补录。
+
+### 运行补录测试
+
+```bash
+python test_makeup_order.py
+```
+
+覆盖场景：
+- 成功补录
+- 重复补录冲突
+- 余额不足
+- 库存不足
+- 菜单未发布
+- 日期不匹配
+- 超出补录天数限制
+- 配置修改与验证
+- 服务重启后对账通过
+
 ## 核心流程示例
 
 ### 1. 发布菜单流程

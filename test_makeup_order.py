@@ -179,7 +179,7 @@ def setup_test_data():
     }
 
 
-def test_successful_makeup(ctx):
+def check_successful_makeup(ctx):
     print_section("测试 1: 成功补录")
 
     r = api(
@@ -235,7 +235,7 @@ def test_successful_makeup(ctx):
     return order if ok else None
 
 
-def test_duplicate_makeup(ctx, order):
+def check_duplicate_makeup(ctx, order):
     print_section("测试 2: 重复补录冲突")
 
     if not order:
@@ -284,7 +284,7 @@ def test_duplicate_makeup(ctx, order):
     print_test("重复补录冲突总结果", ok)
 
 
-def test_insufficient_balance(ctx):
+def check_insufficient_balance(ctx):
     print_section("测试 3: 余额不足")
 
     low_balance_emp = "EMP_LOW"
@@ -335,7 +335,7 @@ def test_insufficient_balance(ctx):
     print_test("余额不足测试总结果", ok)
 
 
-def test_insufficient_stock(ctx):
+def check_insufficient_stock(ctx):
     print_section("测试 4: 库存不足")
 
     menu_detail = api("GET", f"/api/admin/menus/{ctx['menu_id']}").json()
@@ -383,7 +383,7 @@ def test_insufficient_stock(ctx):
     print_test("库存不足测试总结果", ok)
 
 
-def test_menu_not_published(ctx):
+def check_menu_not_published(ctx):
     print_section("测试 5: 菜单未发布")
 
     draft_menu = api("POST", "/api/admin/menus", json={
@@ -439,7 +439,7 @@ def test_menu_not_published(ctx):
     print_test("菜单未发布测试总结果", ok)
 
 
-def test_date_mismatch(ctx):
+def check_date_mismatch(ctx):
     print_section("测试 6: 日期不匹配")
 
     r = api(
@@ -483,7 +483,7 @@ def test_date_mismatch(ctx):
     print_test("日期不匹配测试总结果", ok)
 
 
-def test_date_out_of_range(ctx):
+def check_date_out_of_range(ctx):
     print_section("测试 7: 超出补录天数限制")
 
     old_menu = api("POST", "/api/admin/menus", json={
@@ -541,7 +541,7 @@ def test_date_out_of_range(ctx):
     print_test("超出补录天数限制测试总结果", ok)
 
 
-def test_invalid_source(ctx):
+def check_invalid_source(ctx):
     print_section("测试 8: 补录来源不合法")
 
     r = api(
@@ -586,7 +586,7 @@ def test_invalid_source(ctx):
     print_test("补录来源不合法测试总结果", ok)
 
 
-def test_config_management(ctx):
+def check_config_management(ctx):
     print_section("测试 9: 配置管理")
 
     ok = True
@@ -628,7 +628,7 @@ def test_config_management(ctx):
     print_test("配置管理测试总结果", ok)
 
 
-def test_idempotency(ctx):
+def check_idempotency(ctx):
     print_section("测试 10: 幂等性")
 
     key = f"makeup-idempotency-{int(time.time())}"
@@ -691,7 +691,7 @@ def test_idempotency(ctx):
     print_test("幂等性测试总结果", ok)
 
 
-def test_reboot_consistency(ctx, process):
+def check_reboot_consistency(ctx, process):
     print_section("测试 11: 服务重启后配置和数据一致，对账通过")
 
     print("  记录重启前状态...")
@@ -744,7 +744,7 @@ def test_reboot_consistency(ctx, process):
     return process
 
 
-def test_transactions_complete(ctx):
+def check_transactions_complete(ctx):
     print_section("测试 12: 流水记录完整")
 
     orders = api("GET", "/api/orders", params={"employee_id": "EMP001", "status": "taken"}).json()
@@ -796,18 +796,18 @@ def main():
 
         ctx = setup_test_data()
 
-        order = test_successful_makeup(ctx)
-        test_duplicate_makeup(ctx, order)
-        test_insufficient_balance(ctx)
-        test_insufficient_stock(ctx)
-        test_menu_not_published(ctx)
-        test_date_mismatch(ctx)
-        test_date_out_of_range(ctx)
-        test_invalid_source(ctx)
-        test_config_management(ctx)
-        test_idempotency(ctx)
-        test_transactions_complete(ctx)
-        process = test_reboot_consistency(ctx, process)
+        order = check_successful_makeup(ctx)
+        check_duplicate_makeup(ctx, order)
+        check_insufficient_balance(ctx)
+        check_insufficient_stock(ctx)
+        check_menu_not_published(ctx)
+        check_date_mismatch(ctx)
+        check_date_out_of_range(ctx)
+        check_invalid_source(ctx)
+        check_config_management(ctx)
+        check_idempotency(ctx)
+        check_transactions_complete(ctx)
+        process = check_reboot_consistency(ctx, process)
 
     except Exception as e:
         print(f"\n  [FATAL] 测试执行出错: {e}")
