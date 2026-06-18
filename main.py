@@ -13,6 +13,7 @@ from services import (
     TransactionService,
     ReconciliationService,
     MenuImportExportService,
+    ConfigService,
 )
 
 logging.basicConfig(
@@ -70,6 +71,20 @@ class OrderCreate(BaseModel):
     employee_id: str
     menu_item_id: int
     quantity: int
+
+
+class MakeupOrderCreate(BaseModel):
+    employee_id: str
+    menu_item_id: int
+    quantity: int
+    serving_date: str
+    source: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class ConfigUpdate(BaseModel):
+    value: str
+    description: Optional[str] = None
 
 
 # ========== Error Helper ==========
@@ -228,6 +243,70 @@ def admin_export_menus_csv(
         media_type="text/csv; charset=utf-8-sig",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+# ========== 管理员 - 补录取餐 ==========
+
+
+@app.post("/api/admin/orders/makeup", tags=["管理员"], summary="补录取餐记录")
+def admin_makeup_order(
+    data: MakeupOrderCreate,
+    x_idempotency_key: Optional[str] = Header(None),
+):
+    try:
+        order = OrderService.makeup_order(
+            employee_id=data.employee_id,
+            menu_item_id=data.menu_item_id,
+            quantity=data.quantity,
+            serving_date=data.serving_date,
+            source=data.source,
+            remark=data.remark,
+            idempotency_key=x_idempotency_key,
+        )
+        return order
+    except ValueError as e:
+        msg = str(e)
+        if "重复补录" in msg or "已补录过" in msg:
+            error_response(msg, "DUPLICATE_MAKEUP", 409)
+        elif "余额不足" in msg:
+            error_response(msg, "INSUFFICIENT_BALANCE", 400)
+        elif "库存不足" in msg:
+            error_response(msg, "OUT_OF_STOCK", 400)
+        elif "菜单未发布" in msg:
+            error_response(msg, "MENU_NOT_PUBLISHED", 400)
+        elif "不匹配" in msg and "日期" in msg:
+            error_response(msg, "DATE_MISMATCH", 400)
+        elif "超出允许范围" in msg or "不能晚于今天" in msg or "超过" in msg and "天" in msg:
+            error_response(msg, "DATE_OUT_OF_RANGE", 400)
+        elif "不合法" in msg and "来源" in msg:
+            error_response(msg, "INVALID_SOURCE", 400)
+        elif "格式错误" in msg:
+            error_response(msg, "INVALID_DATE_FORMAT", 400)
+        elif "必须大于0" in msg:
+            error_response(msg, "INVALID_QUANTITY", 400)
+        else:
+            error_response(msg, "MAKEUP_ERROR", 400)
+
+
+# ========== 管理员 - 配置管理 ==========
+
+
+@app.get("/api/admin/config", tags=["管理员"], summary="获取所有配置")
+def admin_list_config():
+    return ConfigService.list_config()
+
+
+@app.get("/api/admin/config/makeup", tags=["管理员"], summary="获取补录相关配置")
+def admin_get_makeup_config():
+    return ConfigService.get_makeup_config()
+
+
+@app.put("/api/admin/config/{key}", tags=["管理员"], summary="更新配置")
+def admin_update_config(key: str, data: ConfigUpdate):
+    try:
+        return ConfigService.set_config(key, data.value, data.description)
+    except Exception as e:
+        error_response(str(e), "CONFIG_ERROR", 400)
 
 
 # ========== 员工 - 菜单浏览 ==========

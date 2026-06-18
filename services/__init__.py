@@ -3,6 +3,7 @@ from services.menu_service import MenuService
 from services.order_service import OrderService
 from services.transaction_service import TransactionService, ReconciliationService
 from services.menu_import_export_service import MenuImportExportService
+from services.config_service import ConfigService
 
 __all__ = [
     "EmployeeService",
@@ -11,4 +12,5 @@ __all__ = [
     "TransactionService",
     "ReconciliationService",
     "MenuImportExportService",
+    "ConfigService",
 ]

@@ -84,6 +84,8 @@ def init_db():
         quantity INTEGER NOT NULL,
         total_amount REAL NOT NULL,
         status TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'normal',
+        makeup_remark TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (employee_id) REFERENCES employees(id),
@@ -106,13 +108,51 @@ def init_db():
         created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        description TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_employee ON transactions(employee_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_order ON transactions(order_id);
     CREATE INDEX IF NOT EXISTS idx_orders_employee ON orders(employee_id);
     CREATE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_makeup_unique 
+        ON orders(employee_id, menu_id, menu_item_id, status) 
+        WHERE status = 'taken' AND source = 'makeup';
     """)
 
+    _add_column_if_not_exists(cur, "orders", "source", "TEXT NOT NULL DEFAULT 'normal'")
+    _add_column_if_not_exists(cur, "orders", "makeup_remark", "TEXT")
+
+    _init_default_config(cur)
+
     conn.commit()
+
+
+def _init_default_config(cur):
+    defaults = [
+        ("makeup_days_limit", "7", "补录允许的最大天数（向前追溯）"),
+        ("makeup_default_source", "window", "补录默认来源标识"),
+        ("makeup_allowed_sources", "window,admin,manual", "允许的补录来源列表，逗号分隔"),
+        ("makeup_default_remark", "线下窗口补录", "补录默认备注"),
+    ]
+    now = now_str()
+    for key, value, desc in defaults:
+        cur.execute(
+            "INSERT OR IGNORE INTO config (key, value, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (key, value, desc, now, now),
+        )
+
+
+def _add_column_if_not_exists(cur, table, column, definition):
+    cur.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cur.fetchall()]
+    if column not in columns:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def now_str():
