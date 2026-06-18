@@ -701,12 +701,41 @@ curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
   "quantity": 2,
   "total_amount": 36.0,
   "status": "taken",
-  "source": "makeup",
+  "source": "window",
   "makeup_remark": "窗口补录-张三",
   "created_at": "2026-06-19 12:00:00",
   "updated_at": "2026-06-19 12:00:00"
 }
 ```
+
+### 成功响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 订单ID |
+| `employee_id` | string | 员工ID |
+| `menu_id` | int | 菜单ID |
+| `menu_item_id` | int | 菜品ID |
+| `item_name` | string | 菜品名称 |
+| `price` | float | 菜品单价 |
+| `quantity` | int | 数量 |
+| `total_amount` | float | 订单总金额 |
+| `status` | string | 订单状态，补录成功后固定为 `taken` |
+| `source` | string | **回显请求中传入的补录来源**，可能的值：`window`（窗口补录）、`admin`（管理员操作）、`manual`（人工登记）等；正常下单的订单此字段为 `normal` |
+| `makeup_remark` | string | 补录备注 |
+| `created_at` | string | 订单创建时间 |
+| `updated_at` | string | 订单更新时间 |
+
+### 补录来源值说明
+
+| 来源值 | 含义 |
+|--------|------|
+| `window` | 线下窗口补录（默认值） |
+| `admin` | 管理员后台操作 |
+| `manual` | 人工登记补录 |
+| `normal` | **正常下单生成**（非补录） |
+
+> **重要**：所有补录订单的 `source` 字段值都**不等于 `normal`**；判断一条订单是否为补录，看 `source <> 'normal'` 即可，不要只判断 `source == 'makeup'`（旧版本遗留写法，已不再使用）。按来源筛选查询时，传入具体值（如 `manual`）即可准确命中。
 
 ### 失败时怎么看结果
 

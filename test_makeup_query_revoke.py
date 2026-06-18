@@ -351,18 +351,46 @@ def test_source_echo_and_filter(ctx):
             if not source_preserved:
                 ok = False
 
+            status_cancelled = revoked["status"] == "cancelled"
+            print_test("撤销后响应status=cancelled", status_cancelled,
+                       f"status={revoked['status']}")
+            if not status_cancelled:
+                ok = False
+
+            revoked_at_ok = bool(revoked.get("revoked_at"))
+            print_test("撤销后响应revoked_at非空", revoked_at_ok,
+                       f"revoked_at={revoked.get('revoked_at')}")
+            if not revoked_at_ok:
+                ok = False
+
             r_q = api("GET", "/api/admin/orders/makeup",
                       params={"employee_id": "SRC002"})
             items = r_q.json().get("items", [])
             if items:
                 q_source = items[0]["source"]
-                log_match = any(
-                    log["operation_type"] == "create" for log in items[0].get("operation_logs", [])
-                )
+                q_status = items[0]["status"]
+                q_revoked_at = items[0].get("revoked_at")
+                op_logs = items[0].get("operation_logs", [])
+                txn_list = items[0].get("transactions", [])
+
+                log_has_create = any(log["operation_type"] == "create" for log in op_logs)
+                log_has_revoke = any(log["operation_type"] == "revoke" for log in op_logs)
+                txn_has_revoke = any(t["type"] == "MAKEUP_REVOKE" for t in txn_list)
+
                 print_test("撤销后查询source仍可追查", q_source == src_to_revoke,
                            f"source={q_source}")
-                print_test("撤销后操作日志含create记录", log_match)
-                if q_source != src_to_revoke or not log_match:
+                print_test("撤销后查询status=cancelled", q_status == "cancelled",
+                           f"status={q_status}")
+                print_test("撤销后查询revoked_at非空", bool(q_revoked_at),
+                           f"revoked_at={q_revoked_at}")
+                print_test("撤销后操作日志含create记录", log_has_create)
+                print_test("撤销后操作日志含revoke记录", log_has_revoke,
+                           f"logs={[(l['operation_type'], l.get('operator')) for l in op_logs]}")
+                print_test("撤销后流水含MAKEUP_REVOKE", txn_has_revoke,
+                           f"types={[t['type'] for t in txn_list]}")
+                if (q_source != src_to_revoke or q_status != "cancelled" or
+                    not bool(q_revoked_at) or not log_has_create or
+                    not log_has_revoke or not txn_has_revoke):
                     ok = False
 
     reconc = api("GET", "/api/admin/reconciliation").json()
