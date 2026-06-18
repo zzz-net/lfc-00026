@@ -299,7 +299,7 @@ class OrderService:
             existing_makeup = conn.execute(
                 """SELECT * FROM orders 
                    WHERE employee_id = ? AND menu_id = ? AND menu_item_id = ? 
-                   AND status = 'taken' AND source = 'makeup'""",
+                   AND status = 'taken' AND source <> 'normal'""",
                 (employee_id, menu_id, menu_item_id),
             ).fetchone()
             if existing_makeup:
@@ -361,7 +361,7 @@ class OrderService:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (order_id, idempotency_key, employee_id, menu_id, menu_item_id,
                      menu_item["name"], menu_item["price"], quantity, total_amount,
-                     OrderService.ORDER_STATUS_PENDING, "makeup", remark, now, now),
+                     OrderService.ORDER_STATUS_PENDING, source, remark, now, now),
                 )
             except sqlite3.IntegrityError as e:
                 if "idx_orders_makeup_unique" in str(e):
@@ -446,7 +446,7 @@ class OrderService:
             JOIN menus m ON o.menu_id = m.id
             JOIN menu_items mi ON o.menu_item_id = mi.id
             JOIN employees e ON o.employee_id = e.id
-            WHERE o.source = 'makeup'
+            WHERE o.source <> 'normal'
         """
         params = []
 
@@ -520,7 +520,7 @@ class OrderService:
             if not order:
                 raise ValueError(f"订单 {order_id} 不存在")
 
-            if order["source"] != "makeup":
+            if order["source"] == "normal":
                 raise ValueError("只能撤销补录生成的订单，该订单非补录来源")
 
             if order["revoked_at"] is not None:

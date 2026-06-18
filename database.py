@@ -132,7 +132,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_makeup_unique 
         ON orders(employee_id, menu_id, menu_item_id, status) 
-        WHERE status = 'taken' AND source = 'makeup';
+        WHERE status = 'taken' AND source <> 'normal';
     CREATE INDEX IF NOT EXISTS idx_orders_makeup_query 
         ON orders(employee_id, source, created_at);
     CREATE INDEX IF NOT EXISTS idx_makeup_log_order ON makeup_operation_log(order_id);
@@ -143,6 +143,8 @@ def init_db():
     _add_column_if_not_exists(cur, "orders", "source", "TEXT NOT NULL DEFAULT 'normal'")
     _add_column_if_not_exists(cur, "orders", "makeup_remark", "TEXT")
     _add_column_if_not_exists(cur, "orders", "revoked_at", "TEXT")
+
+    _migrate_makeup_unique_index(cur)
 
     _init_default_config(cur)
 
@@ -171,6 +173,20 @@ def _add_column_if_not_exists(cur, table, column, definition):
     columns = [row[1] for row in cur.fetchall()]
     if column not in columns:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _migrate_makeup_unique_index(cur):
+    cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_orders_makeup_unique'"
+    )
+    row = cur.fetchone()
+    if row and "source = 'makeup'" in row["sql"]:
+        cur.execute("DROP INDEX idx_orders_makeup_unique")
+        cur.execute(
+            """CREATE UNIQUE INDEX idx_orders_makeup_unique 
+               ON orders(employee_id, menu_id, menu_item_id, status) 
+               WHERE status = 'taken' AND source <> 'normal'"""
+        )
 
 
 def now_str():

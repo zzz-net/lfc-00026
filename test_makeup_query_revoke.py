@@ -267,6 +267,113 @@ def test_query_with_filters(ctx):
     return order1
 
 
+def test_source_echo_and_filter(ctx):
+    print_section("测试 2b: Source 回显、来源筛选与撤销后可追查")
+
+    sources_to_test = ["window", "admin", "manual"]
+    created_orders = {}
+    ok = True
+
+    for i, src in enumerate(sources_to_test):
+        emp_id = f"SRC{i + 1:03d}"
+        api("POST", "/api/admin/employees", json={
+            "id": emp_id, "name": f"来源测试员工{i + 1}", "initial_balance": 100.0,
+        })
+
+        item_id = ctx["item1_id"] if i % 2 == 0 else ctx["item2_id"]
+
+        r = api("POST", "/api/admin/orders/makeup", json={
+            "employee_id": emp_id,
+            "menu_item_id": item_id,
+            "quantity": 1,
+            "serving_date": ctx["today"],
+            "source": src,
+            "remark": f"来源{src}测试",
+        })
+
+        if r.status_code != 200:
+            print_test(f"创建来源={src}的补录", False, f"{r.json()}")
+            ok = False
+            continue
+
+        order = r.json()
+        created_orders[src] = order
+
+        source_echo_ok = order["source"] == src
+        print_test(f"来源{src}回显正确", source_echo_ok,
+                   f"请求={src}, 返回={order['source']}")
+        if not source_echo_ok:
+            ok = False
+
+        status_ok = order["status"] == "taken"
+        print_test(f"来源{src}订单状态为taken", status_ok)
+        if not status_ok:
+            ok = False
+
+    for src in sources_to_test:
+        if src not in created_orders:
+            continue
+        r = api("GET", "/api/admin/orders/makeup", params={"source": src})
+        if r.status_code != 200:
+            print_test(f"按来源{src}筛选查询成功", False, f"状态码 {r.status_code}")
+            ok = False
+            continue
+
+        data = r.json()
+        found = any(item["id"] == created_orders[src]["id"] for item in data.get("items", []))
+        print_test(f"按来源{src}筛选命中对应订单", found,
+                   f"查询到{data.get('total')}条, 含目标订单={found}")
+        if not found:
+            ok = False
+
+        all_match = all(item["source"] == src for item in data.get("items", []))
+        print_test(f"按来源{src}筛选结果全部匹配", all_match)
+        if not all_match:
+            ok = False
+
+    r_all = api("GET", "/api/admin/orders/makeup")
+    total_all = r_all.json().get("total", 0)
+    print_test(f"无筛选查询返回所有补录（>= {len(sources_to_test)}条）",
+               total_all >= len(sources_to_test), f"实际={total_all}")
+    if total_all < len(sources_to_test):
+        ok = False
+
+    src_to_revoke = "admin"
+    if src_to_revoke in created_orders:
+        order_to_revoke = created_orders[src_to_revoke]
+        r = api("POST", f"/api/admin/orders/makeup/{order_to_revoke['id']}/revoke",
+                json={"remark": "撤销后验证source"})
+        if r.status_code == 200:
+            revoked = r.json()
+            source_preserved = revoked["source"] == src_to_revoke
+            print_test("撤销后订单source仍保留", source_preserved,
+                       f"source={revoked['source']}")
+            if not source_preserved:
+                ok = False
+
+            r_q = api("GET", "/api/admin/orders/makeup",
+                      params={"employee_id": "SRC002"})
+            items = r_q.json().get("items", [])
+            if items:
+                q_source = items[0]["source"]
+                log_match = any(
+                    log["operation_type"] == "create" for log in items[0].get("operation_logs", [])
+                )
+                print_test("撤销后查询source仍可追查", q_source == src_to_revoke,
+                           f"source={q_source}")
+                print_test("撤销后操作日志含create记录", log_match)
+                if q_source != src_to_revoke or not log_match:
+                    ok = False
+
+    reconc = api("GET", "/api/admin/reconciliation").json()
+    print_test("对账一致", reconc["consistent"], f"Issues: {reconc.get('issues', [])}")
+    if not reconc["consistent"]:
+        ok = False
+
+    print_test("Source回显与筛选总结果", ok)
+    return created_orders.get("window")
+
+
 def test_revoke_makeup_success(ctx, order):
     print_section("测试 3: 成功撤销补录")
 
@@ -747,6 +854,7 @@ def main():
 
         test_query_makeup_empty(ctx)
         order_for_revoke = test_query_with_filters(ctx)
+        test_source_echo_and_filter(ctx)
         revoked_order = test_revoke_makeup_success(ctx, order_for_revoke)
         test_revoke_duplicate(ctx, revoked_order)
         test_revoke_not_found(ctx)

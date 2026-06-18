@@ -206,7 +206,7 @@ def check_successful_makeup(ctx):
     ok = True
     checks = [
         ("订单状态为 taken", order["status"] == "taken"),
-        ("来源为 makeup", order["source"] == "makeup"),
+        ("来源为 window", order["source"] == "window"),
         ("备注正确", order.get("makeup_remark") == "测试补录"),
         ("金额正确", abs(order["total_amount"] - expected_amount) < 0.001),
         ("数量正确", order["quantity"] == 1),
@@ -682,7 +682,7 @@ def check_idempotency(ctx):
         ok = False
 
     orders = api("GET", "/api/orders", params={"employee_id": "EMP003", "status": "taken"}).json()
-    makeup_count = sum(1 for o in orders if o.get("source") == "makeup")
+    makeup_count = sum(1 for o in orders if o.get("source") != "normal")
     count_ok = makeup_count == 1
     print_test("只创建了1条补录订单", count_ok, f"实际: {makeup_count}")
     if not count_ok:
@@ -748,7 +748,7 @@ def check_transactions_complete(ctx):
     print_section("测试 12: 流水记录完整")
 
     orders = api("GET", "/api/orders", params={"employee_id": "EMP001", "status": "taken"}).json()
-    makeup_orders = [o for o in orders if o.get("source") == "makeup"]
+    makeup_orders = [o for o in orders if o.get("source") != "normal"]
 
     if not makeup_orders:
         print_test("跳过流水测试（无补录订单）", False)
