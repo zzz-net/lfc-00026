@@ -42,9 +42,23 @@ def on_startup():
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = []
+    missing_source = False
     for error in exc.errors():
-        field = ".".join(str(loc) for loc in error["loc"])
+        loc_parts = [str(loc) for loc in error.get("loc", [])]
+        field = ".".join(loc_parts)
+        if "source" in loc_parts and error.get("type") in ("missing", "string_type", "none_required"):
+            missing_source = True
         errors.append(f"{field}: {error['msg']}")
+    if missing_source and request.url.path.endswith("/orders/makeup"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": "MISSING_SOURCE",
+                    "message": "补录来源不能为空",
+                }
+            },
+        )
     return JSONResponse(
         status_code=400,
         content={
@@ -100,8 +114,26 @@ class MakeupOrderCreate(BaseModel):
     menu_item_id: int
     quantity: int
     serving_date: str
-    source: Optional[str] = None
+    source: str
     remark: Optional[str] = None
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "employee_id": "E001",
+                "menu_item_id": 5,
+                "quantity": 1,
+                "serving_date": "2026-06-19",
+                "source": "admin",
+                "remark": "后台补录"
+            }
+        }
+    }
+
+
+class MakeupOrderErrorResponse(BaseModel):
+    code: str
+    message: str
 
 
 class MakeupRevokeRequest(BaseModel):
@@ -299,7 +331,31 @@ def admin_export_menus_csv(
 # ========== 管理员 - 补录取餐 ==========
 
 
-@app.post("/api/admin/orders/makeup", tags=["管理员"], summary="补录取餐记录")
+@app.post(
+    "/api/admin/orders/makeup",
+    tags=["管理员"],
+    summary="补录取餐记录",
+    responses={
+        400: {
+            "model": MakeupOrderErrorResponse,
+            "description": "补录失败：来源缺失/未匹配规则/规则禁用/余额不足/库存不足等",
+            "content": {
+                "application/json": {
+                    "example": {"detail": {"code": "MISSING_SOURCE", "message": "补录来源不能为空"}}
+                }
+            }
+        },
+        409: {
+            "model": MakeupOrderErrorResponse,
+            "description": "重复补录",
+            "content": {
+                "application/json": {
+                    "example": {"detail": {"code": "DUPLICATE_MAKEUP", "message": "该员工当日已补录该菜品"}}
+                }
+            }
+        }
+    }
+)
 def admin_makeup_order(
     data: MakeupOrderCreate,
     x_idempotency_key: Optional[str] = Header(None),
