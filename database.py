@@ -148,7 +148,10 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_makeup_log_created ON makeup_operation_log(created_at);
     """)
 
+    _init_source_rules_table(cur)
+    _init_source_rules_import_log_table(cur)
     _init_default_config(cur)
+    _init_default_source_rules(cur)
 
     conn.commit()
 
@@ -193,3 +196,92 @@ def _migrate_makeup_unique_index(cur):
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+SOURCE_RULES_VERSION = "1.0"
+
+
+def _init_source_rules_table(cur):
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS source_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        description TEXT,
+        priority INTEGER NOT NULL DEFAULT 0,
+        is_enabled INTEGER NOT NULL DEFAULT 1,
+        match_pattern TEXT,
+        version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_source_rules_code ON source_rules(code);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_priority ON source_rules(priority);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_enabled ON source_rules(is_enabled);
+    """)
+
+
+def _init_source_rules_import_log_table(cur):
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS source_rules_import_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_version TEXT NOT NULL,
+        rules_count INTEGER NOT NULL,
+        success_count INTEGER NOT NULL,
+        skipped_count INTEGER NOT NULL,
+        error_count INTEGER NOT NULL,
+        conflict_strategy TEXT NOT NULL,
+        result_summary TEXT,
+        details_json TEXT,
+        created_at TEXT NOT NULL
+    );
+    """)
+
+
+def _init_default_source_rules(cur):
+    defaults = [
+        {
+            "code": "window",
+            "name": "线下窗口",
+            "description": "食堂窗口人工补录",
+            "priority": 100,
+            "is_enabled": 1,
+            "match_pattern": None,
+        },
+        {
+            "code": "admin",
+            "name": "管理员后台",
+            "description": "管理员在后台系统补录",
+            "priority": 90,
+            "is_enabled": 1,
+            "match_pattern": None,
+        },
+        {
+            "code": "manual",
+            "name": "手动导入",
+            "description": "通过批量导入方式补录",
+            "priority": 80,
+            "is_enabled": 1,
+            "match_pattern": None,
+        },
+    ]
+
+    now = now_str()
+    for rule in defaults:
+        cur.execute(
+            """INSERT OR IGNORE INTO source_rules 
+               (code, name, description, priority, is_enabled, match_pattern, version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                rule["code"],
+                rule["name"],
+                rule["description"],
+                rule["priority"],
+                rule["is_enabled"],
+                rule["match_pattern"],
+                SOURCE_RULES_VERSION,
+                now,
+                now,
+            ),
+        )

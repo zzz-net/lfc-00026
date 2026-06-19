@@ -1,6 +1,7 @@
 import logging
-from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -14,6 +15,7 @@ from services import (
     ReconciliationService,
     MenuImportExportService,
     ConfigService,
+    SourceRuleService,
 )
 
 logging.basicConfig(
@@ -22,6 +24,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+logging.getLogger("services.source_rule_service").setLevel(logging.WARNING)
 
 app = FastAPI(
     title="食堂订餐扣费系统",
@@ -33,6 +37,24 @@ app = FastAPI(
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for error in exc.errors():
+        field = ".".join(str(loc) for loc in error["loc"])
+        errors.append(f"{field}: {error['msg']}")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": {
+                "code": "VALIDATION_ERROR",
+                "message": "请求数据验证失败",
+                "errors": errors,
+            }
+        },
+    )
 
 
 # ========== Pydantic Models ==========
@@ -89,6 +111,28 @@ class MakeupRevokeRequest(BaseModel):
 class ConfigUpdate(BaseModel):
     value: str
     description: Optional[str] = None
+
+
+class SourceRuleCreate(BaseModel):
+    code: str
+    name: str
+    description: Optional[str] = None
+    priority: int = 0
+    is_enabled: bool = True
+    match_pattern: Optional[str] = None
+
+
+class SourceRuleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[int] = None
+    is_enabled: Optional[bool] = None
+    match_pattern: Optional[str] = None
+
+
+class SourceRulesImportRequest(BaseModel):
+    rules: List[dict]
+    conflict_strategy: str = "skip"
 
 
 # ========== Error Helper ==========
@@ -361,6 +405,121 @@ def admin_update_config(key: str, data: ConfigUpdate):
         return ConfigService.set_config(key, data.value, data.description)
     except Exception as e:
         error_response(str(e), "CONFIG_ERROR", 400)
+
+
+# ========== 管理员 - 来源规则管理 ==========
+
+
+@app.get("/api/admin/source-rules", tags=["管理员"], summary="获取所有来源规则（含各层级）")
+def admin_list_source_rules():
+    try:
+        return SourceRuleService.list_rules()
+    except Exception as e:
+        error_response(str(e), "SOURCE_RULE_ERROR", 400)
+
+
+@app.post("/api/admin/source-rules", tags=["管理员"], summary="创建来源规则")
+def admin_create_source_rule(data: SourceRuleCreate):
+    try:
+        rule = SourceRuleService.create_rule(
+            code=data.code,
+            name=data.name,
+            description=data.description,
+            priority=data.priority,
+            is_enabled=data.is_enabled,
+            match_pattern=data.match_pattern,
+        )
+        return rule.to_dict()
+    except ValueError as e:
+        msg = str(e)
+        if "已存在" in msg:
+            error_response(msg, "SOURCE_RULE_EXISTS", 409)
+        else:
+            error_response(msg, "SOURCE_RULE_VALIDATION_ERROR", 400)
+
+
+@app.post("/api/admin/source-rules/import", tags=["管理员"], summary="批量导入来源规则")
+def admin_import_source_rules(data: SourceRulesImportRequest):
+    try:
+        result = SourceRuleService.import_rules(
+            rules_data=data.rules,
+            conflict_strategy=data.conflict_strategy,
+        )
+        if not result["success"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": {
+                        "code": "SOURCE_RULE_IMPORT_ERROR",
+                        "message": "导入数据校验失败或存在冲突",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "SOURCE_RULE_IMPORT_ERROR", 400)
+
+
+@app.get("/api/admin/source-rules/export/json", tags=["管理员"], summary="导出来源规则(JSON)")
+def admin_export_source_rules_json(
+    only_enabled: bool = Query(True, description="仅导出启用的规则"),
+):
+    return SourceRuleService.export_rules(only_enabled=only_enabled)
+
+
+@app.get("/api/admin/source-rules/import-history", tags=["管理员"], summary="获取导入历史")
+def admin_get_import_history(
+    limit: int = Query(20, ge=1, le=100, description="返回条数"),
+):
+    try:
+        return SourceRuleService.get_import_history(limit=limit)
+    except Exception as e:
+        error_response(str(e), "SOURCE_RULE_ERROR", 400)
+
+
+@app.get("/api/admin/source-rules/{code}", tags=["管理员"], summary="获取单个来源规则")
+def admin_get_source_rule(code: str):
+    try:
+        rule = SourceRuleService.get_rule(code)
+        if not rule:
+            error_response(f"来源规则 {code} 不存在", "SOURCE_RULE_NOT_FOUND", 404)
+        return rule.to_dict()
+    except ValueError as e:
+        error_response(str(e), "SOURCE_RULE_ERROR", 400)
+
+
+@app.patch("/api/admin/source-rules/{code}", tags=["管理员"], summary="更新来源规则")
+def admin_update_source_rule(code: str, data: SourceRuleUpdate):
+    try:
+        rule = SourceRuleService.update_rule(
+            code=code,
+            name=data.name,
+            description=data.description,
+            priority=data.priority,
+            is_enabled=data.is_enabled,
+            match_pattern=data.match_pattern,
+        )
+        return rule.to_dict()
+    except ValueError as e:
+        msg = str(e)
+        if "不存在" in msg:
+            error_response(msg, "SOURCE_RULE_NOT_FOUND", 404)
+        else:
+            error_response(msg, "SOURCE_RULE_VALIDATION_ERROR", 400)
+
+
+@app.delete("/api/admin/source-rules/{code}", tags=["管理员"], summary="删除来源规则")
+def admin_delete_source_rule(code: str):
+    try:
+        SourceRuleService.delete_rule(code)
+        return {"success": True, "message": f"来源规则 {code} 已删除"}
+    except ValueError as e:
+        msg = str(e)
+        if "不存在" in msg:
+            error_response(msg, "SOURCE_RULE_NOT_FOUND", 404)
+        else:
+            error_response(msg, "SOURCE_RULE_ERROR", 400)
 
 
 # ========== 员工 - 菜单浏览 ==========

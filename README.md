@@ -783,6 +783,170 @@ curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup \
 
 补录接口支持 `X-Idempotency-Key` 请求头，使用相同的幂等键重复请求会返回同一结果，不会重复补录。
 
+### 查询补录记录
+
+**接口**：`GET /api/admin/orders/makeup`
+
+支持分页查询，按多条件筛选补录记录；返回的每条记录会附带关联的**流水明细**和**操作日志**。
+
+**请求参数（Query）**：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `employee_id` | 否 | 员工ID筛选 |
+| `serving_date` | 否 | 供餐日期 YYYY-MM-DD |
+| `source` | 否 | **补录来源筛选**，传具体值如 `window`、`admin`、`manual`，只返回对应来源的补录 |
+| `operation_time_start` | 否 | 操作时间起 YYYY-MM-DD HH:MM:SS |
+| `operation_time_end` | 否 | 操作时间止 YYYY-MM-DD HH:MM:SS |
+| `page` | 否 | 页码，默认 1 |
+| `page_size` | 否 | 每页条数，默认 20，最大 100 |
+
+调用示例：
+
+```bash
+# 按来源=manual 筛选补录记录
+curl "http://127.0.0.1:8000/api/admin/orders/makeup?source=manual"
+
+# 按员工 + 来源 联合筛选
+curl "http://127.0.0.1:8000/api/admin/orders/makeup?employee_id=EMP001&source=admin"
+```
+
+**成功响应示例**：
+
+```json
+{
+  "total": 2,
+  "page": 1,
+  "page_size": 20,
+  "items": [
+    {
+      "id": "ORD1781816702ABC12345",
+      "employee_id": "EMP001",
+      "employee_name": "张三",
+      "menu_id": 1,
+      "menu_item_id": 1,
+      "item_name": "红烧肉",
+      "dish_name": "红烧肉",
+      "price": 18.0,
+      "dish_price": 18.0,
+      "quantity": 2,
+      "total_amount": 36.0,
+      "status": "taken",
+      "source": "manual",
+      "serving_date": "2026-06-19",
+      "makeup_remark": "人工登记补录",
+      "revoked_at": null,
+      "order_created_at": "2026-06-19 12:00:00",
+      "order_updated_at": "2026-06-19 12:00:00",
+      "transactions": [
+        {
+          "type": "FREEZE",
+          "amount": -36.0,
+          "balance_before": 100.0,
+          "balance_after": 64.0,
+          "frozen_before": 0.0,
+          "frozen_after": 36.0,
+          "description": "冻结订单金额",
+          "created_at": "2026-06-19 12:00:00"
+        },
+        {
+          "type": "SETTLE",
+          "amount": 0.0,
+          "balance_before": 64.0,
+          "balance_after": 64.0,
+          "frozen_before": 36.0,
+          "frozen_after": 0.0,
+          "description": "结算订单",
+          "created_at": "2026-06-19 12:00:00"
+        }
+      ],
+      "operation_logs": [
+        {
+          "operation_type": "create",
+          "operator": "manual",
+          "remark": "人工登记补录",
+          "created_at": "2026-06-19 12:00:00"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**查询响应关键字段说明**：
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 符合筛选条件的补录订单总数 |
+| `items[].source` | 补录来源，与创建时传入的值一致（window/admin/manual）；可用于前端按来源分组显示 |
+| `items[].status` | 订单状态，已撤销的补录为 `cancelled`，未撤销的补录为 `taken` |
+| `items[].revoked_at` | 撤销时间，已撤销的补录有值，未撤销的为 `null` |
+| `items[].transactions` | 该订单关联的所有流水（FREEZE/SETTLE/MAKEUP_REVOKE） |
+| `items[].operation_logs` | 该订单的操作日志，至少有一条 `create`，已撤销的额外有一条 `revoke`，日志里的 `operator` 字段保留了补录来源值 |
+
+### 撤销补录
+
+**接口**：`POST /api/admin/orders/makeup/{order_id}/revoke`
+
+只允许撤销补录生成的订单（`source <> 'normal'`）。撤销后：
+- 订单状态改为 `cancelled`，`revoked_at` 写入撤销时间
+- **`source` 字段保持原补录来源不变**，仍可按来源追查
+- 余额回退（原路退款）
+- 库存 `sold_count` 回退
+- 新增一条 `MAKEUP_REVOKE` 流水
+- 写入一条 `revoke` 操作日志
+
+**请求体**：
+
+```json
+{
+  "remark": "误录，需要撤销"
+}
+```
+
+`remark` 可选。
+
+调用示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup/ORD1781816702ABC12345/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"remark": "误录，需要撤销"}'
+```
+
+**成功响应示例**：
+
+```json
+{
+  "id": "ORD1781816702ABC12345",
+  "employee_id": "EMP001",
+  "menu_item_id": 1,
+  "item_name": "红烧肉",
+  "quantity": 2,
+  "total_amount": 36.0,
+  "status": "cancelled",
+  "source": "manual",
+  "makeup_remark": "人工登记补录",
+  "revoked_at": "2026-06-19 15:30:00",
+  "created_at": "2026-06-19 12:00:00",
+  "updated_at": "2026-06-19 15:30:00"
+}
+```
+
+> **注意**：撤销成功后的响应里 `source` 仍然是原补录来源（如 `manual`），不会变成 `revoked` 或其他值；`operation_logs` 里会同时存在 `create` 和 `revoke` 两条日志，可通过查询接口按来源继续定位到该条记录。
+
+**常见错误码**：
+
+| 错误码 | HTTP状态 | 原因 |
+|--------|----------|------|
+| `ORDER_NOT_FOUND` | 404 | 订单不存在 |
+| `ALREADY_REVOKED` | 409 | 该补录已被撤销，不可重复撤销 |
+| `ORDER_ALREADY_CANCELLED` | 409 | 订单已取消 |
+| `NOT_MAKEUP_ORDER` | 400 | 该订单不是补录生成的（source=normal），不允许撤销 |
+| `ORDER_STATUS_ERROR` | 400 | 订单状态不满足撤销条件（非 taken） |
+| `REVOKE_NOT_ALLOWED` | 403 | 当前配置不允许撤销补录 |
+| `REVOKE_DEADLINE_EXCEEDED` | 400 | 超出撤销时限 |
+
 ### 运行补录测试
 
 ```bash

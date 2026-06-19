@@ -4,6 +4,7 @@ from services.order_service import OrderService
 from services.transaction_service import TransactionService, ReconciliationService
 from services.menu_import_export_service import MenuImportExportService
 from services.config_service import ConfigService
+from services.source_rule_service import SourceRuleService
 
 __all__ = [
     "EmployeeService",
@@ -13,4 +14,5 @@ __all__ = [
     "ReconciliationService",
     "MenuImportExportService",
     "ConfigService",
+    "SourceRuleService",
 ]

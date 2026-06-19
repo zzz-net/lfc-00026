@@ -1,12 +1,15 @@
 import uuid
 import logging
 import sqlite3
+import json
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
 
 from database import get_db, transaction, now_str
 from services.menu_service import MenuService
 from services.employee_service import EmployeeService
 from services.config_service import ConfigService
+from services.source_rule_service import SourceRuleService
 
 logger = logging.getLogger(__name__)
 
@@ -247,16 +250,37 @@ class OrderService:
 
         makeup_cfg = ConfigService.get_makeup_config()
         days_limit = makeup_cfg["days_limit"]
-        allowed_sources = makeup_cfg["allowed_sources"]
         default_source = makeup_cfg["default_source"]
         default_remark = makeup_cfg["default_remark"]
 
         source = source or default_source
         remark = remark or default_remark
 
-        if source not in allowed_sources:
-            raise ValueError(
-                f"补录来源 '{source}' 不合法，允许的来源: {', '.join(allowed_sources)}"
+        is_valid, error_msg, matched_rule = SourceRuleService.validate_source(source)
+        if not is_valid:
+            logger.warning(
+                f"[补录] 来源验证失败: source={source}, error={error_msg}"
+            )
+            raise ValueError(error_msg)
+
+        matched_rule_info = None
+        if matched_rule:
+            matched_rule_info = matched_rule.to_dict()
+            logger.info(
+                json.dumps({
+                    "event": "source_rule_matched",
+                    "order": {
+                        "employee_id": employee_id,
+                        "menu_item_id": menu_item_id,
+                        "quantity": quantity,
+                        "serving_date": serving_date,
+                    },
+                    "matched_rule": matched_rule_info,
+                    "rule_code": matched_rule.code,
+                    "rule_name": matched_rule.name,
+                    "rule_priority": matched_rule.priority,
+                    "rule_layer": matched_rule.source_layer,
+                }, ensure_ascii=False)
             )
 
         serving_date_obj = datetime.strptime(serving_date, "%Y-%m-%d").date()
@@ -415,13 +439,29 @@ class OrderService:
                 (order_id, "create", source, remark, now),
             )
 
+            row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            order_dict = dict(row)
+
+            if matched_rule_info:
+                order_dict["matched_source_rule"] = matched_rule_info
+
             logger.info(
-                f"[补录] 成功: 订单={order_id}, 员工={employee_id}, 菜品={menu_item['name']}, "
-                f"数量={quantity}, 金额={total_amount}, 来源={source}"
+                json.dumps({
+                    "event": "makeup_order_created",
+                    "order_id": order_id,
+                    "employee_id": employee_id,
+                    "menu_item_id": menu_item_id,
+                    "quantity": quantity,
+                    "total_amount": total_amount,
+                    "source": source,
+                    "matched_rule": matched_rule_info,
+                    "rule_code": matched_rule.code if matched_rule else None,
+                    "rule_name": matched_rule.name if matched_rule else None,
+                    "rule_layer": matched_rule.source_layer if matched_rule else None,
+                }, ensure_ascii=False)
             )
 
-            row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-            return dict(row)
+            return order_dict
 
     @staticmethod
     def query_makeup_orders(
@@ -475,10 +515,16 @@ class OrderService:
 
         rows = conn.execute(query, params).fetchall()
 
+        merged_rules = {r.code: r.to_dict() for r in SourceRuleService.get_merged_rules(conn)}
+
         items = []
         for row in rows:
             order_dict = dict(row)
             order_id = order_dict["id"]
+            order_source = order_dict.get("source")
+
+            if order_source and order_source in merged_rules:
+                order_dict["matched_source_rule"] = merged_rules[order_source]
 
             txns = conn.execute(
                 """SELECT type, amount, balance_before, balance_after,
@@ -585,10 +631,26 @@ class OrderService:
                 (order_id, "revoke", "admin", remark, now),
             )
 
+            row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            order_dict = dict(row)
+
+            matched_rule = SourceRuleService.match_source(order_dict.get("source", ""), conn)
+            if matched_rule:
+                order_dict["matched_source_rule"] = matched_rule.to_dict()
+
             logger.info(
-                f"[补录撤销] 成功: 订单={order_id}, 员工={order['employee_id']}, "
-                f"退款={order['total_amount']}, 备注={remark}"
+                json.dumps({
+                    "event": "makeup_order_revoked",
+                    "order_id": order_id,
+                    "employee_id": order["employee_id"],
+                    "refund_amount": order["total_amount"],
+                    "source": order["source"],
+                    "remark": remark,
+                    "matched_rule": matched_rule.to_dict() if matched_rule else None,
+                    "rule_code": matched_rule.code if matched_rule else None,
+                    "rule_name": matched_rule.name if matched_rule else None,
+                    "rule_layer": matched_rule.source_layer if matched_rule else None,
+                }, ensure_ascii=False)
             )
 
-            row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-            return dict(row)
+            return order_dict
