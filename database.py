@@ -255,12 +255,20 @@ def _init_source_rules_import_log_table(cur):
         success_count INTEGER NOT NULL,
         skipped_count INTEGER NOT NULL,
         error_count INTEGER NOT NULL,
+        new_count INTEGER NOT NULL DEFAULT 0,
+        overwritten_count INTEGER NOT NULL DEFAULT 0,
+        disabled_blocked_count INTEGER NOT NULL DEFAULT 0,
         conflict_strategy TEXT NOT NULL,
         result_summary TEXT,
         details_json TEXT,
+        operator TEXT,
         created_at TEXT NOT NULL
     );
     """)
+    _add_column_if_not_exists(cur, "source_rules_import_log", "operator", "TEXT")
+    _add_column_if_not_exists(cur, "source_rules_import_log", "new_count", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_not_exists(cur, "source_rules_import_log", "overwritten_count", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_not_exists(cur, "source_rules_import_log", "disabled_blocked_count", "INTEGER NOT NULL DEFAULT 0")
 
 
 def _init_default_source_rules(cur):

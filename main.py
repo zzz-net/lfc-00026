@@ -504,13 +504,17 @@ def admin_create_source_rule(data: SourceRuleCreate):
             error_response(msg, "SOURCE_RULE_VALIDATION_ERROR", 400)
 
 
-@app.post("/api/admin/source-rules/import", tags=["管理员"], summary="批量导入来源规则")
-def admin_import_source_rules(data: SourceRulesImportRequest):
+@app.post("/api/admin/source-rules/import", tags=["管理员"], summary="批量导入来源规则（支持dry-run预检）")
+def admin_import_source_rules(
+    data: SourceRulesImportRequest,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+):
     try:
         result = SourceRuleService.import_rules(
             rules_data=data.rules,
             conflict_strategy=data.conflict_strategy,
             dry_run=data.dry_run,
+            operator=x_operator,
         )
         if not result["success"]:
             return JSONResponse(
@@ -528,12 +532,53 @@ def admin_import_source_rules(data: SourceRulesImportRequest):
         error_response(str(e), "SOURCE_RULE_IMPORT_ERROR", 400)
 
 
+@app.post("/api/admin/source-rules/import/dry-run", tags=["管理员"], summary="导入预检（dry-run专用）")
+def admin_import_source_rules_dry_run(
+    data: SourceRulesImportRequest,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+):
+    try:
+        result = SourceRuleService.import_rules(
+            rules_data=data.rules,
+            conflict_strategy=data.conflict_strategy,
+            dry_run=True,
+            operator=x_operator,
+        )
+        return result
+    except ValueError as e:
+        error_response(str(e), "SOURCE_RULE_IMPORT_ERROR", 400)
+
+
 @app.get("/api/admin/source-rules/export/json", tags=["管理员"], summary="导出来源规则(JSON)")
 def admin_export_source_rules_json(
     only_enabled: bool = Query(True, description="仅导出启用的规则"),
     include_all_layers: bool = Query(False, description="包含所有层级(default/environment/runtime)"),
 ):
     return SourceRuleService.export_rules(only_enabled=only_enabled, include_all_layers=include_all_layers)
+
+
+@app.get("/api/admin/source-rules/export/csv", tags=["管理员"], summary="导出来源规则(CSV)")
+def admin_export_source_rules_csv(
+    only_enabled: bool = Query(True, description="仅导出启用的规则"),
+):
+    csv_content = SourceRuleService.export_rules_csv(only_enabled=only_enabled)
+    filename = f"source_rules_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/admin/source-rules/import-history/{import_id}", tags=["管理员"], summary="获取单条导入历史详情")
+def admin_get_import_history_detail(import_id: int):
+    try:
+        history = SourceRuleService.get_import_history(import_id=import_id)
+        if not history:
+            error_response(f"导入记录 {import_id} 不存在", "IMPORT_NOT_FOUND", 404)
+        return history[0]
+    except Exception as e:
+        error_response(str(e), "SOURCE_RULE_ERROR", 400)
 
 
 @app.get("/api/admin/source-rules/import-history", tags=["管理员"], summary="获取导入历史")

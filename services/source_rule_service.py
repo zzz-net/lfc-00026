@@ -887,6 +887,7 @@ class SourceRuleService:
         rules_data: List[Dict[str, Any]],
         conflict_strategy: str = "skip",
         dry_run: bool = False,
+        operator: str = None,
         conn=None,
     ) -> Dict[str, Any]:
         if conflict_strategy not in SourceRuleService.CONFLICT_STRATEGIES:
@@ -902,10 +903,19 @@ class SourceRuleService:
             "success_count": 0,
             "skipped_count": 0,
             "error_count": 0,
-            "conflicts": [],
+            "new_count": 0,
+            "overwritten_count": 0,
+            "disabled_blocked_count": 0,
+            "new_rules": [],
+            "overwritten_rules": [],
+            "skipped_rules": [],
+            "conflict_rules": [],
+            "disabled_blocked_rules": [],
+            "invalid_rules": [],
             "errors": [],
             "imported_rules": [],
             "dry_run": dry_run,
+            "operator": operator,
         }
 
         if not isinstance(rules_data, list):
@@ -917,13 +927,18 @@ class SourceRuleService:
         def _execute(conn_inner):
             now = now_str()
             existing_db_codes = {
-                row["code"] for row in conn_inner.execute(
-                    "SELECT code FROM source_rules"
+                row["code"]: dict(row) for row in conn_inner.execute(
+                    "SELECT * FROM source_rules"
                 ).fetchall()
             }
+            for code in existing_db_codes:
+                existing_db_codes[code]["is_enabled"] = bool(existing_db_codes[code]["is_enabled"])
 
             merged_rules = SourceRuleService.get_merged_rules(conn_inner)
             merged_codes = {r.code: r for r in merged_rules}
+
+            all_runtime_rules = SourceRuleService.get_runtime_rules(conn_inner)
+            all_runtime_dict = {r.code: r for r in all_runtime_rules}
 
             for idx, rule_data in enumerate(rules_data):
                 rule_identifier = rule_data.get("code", f"index={idx}")
@@ -935,6 +950,12 @@ class SourceRuleService:
                         f"规则 {rule_identifier}: 版本 {version} 不支持，"
                         f"支持的版本: {', '.join(SourceRuleService.SUPPORTED_VERSIONS)}"
                     )
+                    results["invalid_rules"].append({
+                        "code": rule_identifier,
+                        "index": idx,
+                        "reason": f"版本 {version} 不支持",
+                        "incoming_rule": rule_data,
+                    })
                     continue
 
                 is_valid, validation_errors = SourceRuleService.validate_rule_data(rule_data)
@@ -943,9 +964,16 @@ class SourceRuleService:
                     results["errors"].append(
                         f"规则 {rule_identifier} 验证失败: {'; '.join(validation_errors)}"
                     )
+                    results["invalid_rules"].append({
+                        "code": rule_identifier,
+                        "index": idx,
+                        "reason": f"验证失败: {'; '.join(validation_errors)}",
+                        "incoming_rule": rule_data,
+                    })
                     continue
 
                 code = rule_data["code"]
+                is_enabled_incoming = rule_data.get("is_enabled", True)
 
                 conflict_with_merged = None
                 if code in merged_codes:
@@ -961,49 +989,93 @@ class SourceRuleService:
                     }
 
                 conflict_with_db = code in existing_db_codes
+                existing_db_rule = existing_db_codes.get(code)
+
+                disabled_blocked = False
+                if conflict_with_db and existing_db_rule:
+                    if existing_db_rule["is_enabled"] and not is_enabled_incoming:
+                        disabled_blocked = True
+                        block_reason = (
+                            f"规则 {code} 当前已启用，导入后将被禁用，"
+                            f"这将阻止使用该来源的新补录请求"
+                        )
+                        block_entry = {
+                            "code": code,
+                            "index": idx,
+                            "reason": block_reason,
+                            "incoming_rule": {
+                                "code": code,
+                                "name": rule_data.get("name"),
+                                "is_enabled": is_enabled_incoming,
+                            },
+                            "existing_rule": {
+                                "code": code,
+                                "name": existing_db_rule.get("name"),
+                                "is_enabled": existing_db_rule["is_enabled"],
+                                "source_layer": "runtime",
+                            },
+                            "impact": "导入后该来源将被禁用，新的补录请求会被拒绝，历史记录不受影响",
+                        }
+                        results["disabled_blocked_rules"].append(block_entry)
+                        results["disabled_blocked_count"] += 1
+                        logger.warning(json.dumps({
+                            "event": "source_rule_import_disabled_blocked",
+                            "code": code,
+                            "reason": block_reason,
+                            "operator": operator,
+                        }, ensure_ascii=False))
+
+                detail_entry = {
+                    "code": code,
+                    "index": idx,
+                    "strategy": conflict_strategy,
+                    "incoming_rule": {
+                        "code": code,
+                        "name": rule_data.get("name"),
+                        "priority": rule_data.get("priority", 0),
+                        "category": rule_data.get("category", "general"),
+                        "is_enabled": is_enabled_incoming,
+                        "match_pattern": rule_data.get("match_pattern"),
+                        "description": rule_data.get("description"),
+                    },
+                    "existing_rule": conflict_with_merged or (
+                        {"code": code, "source_layer": "runtime", **existing_db_rule}
+                        if existing_db_rule else None
+                    ),
+                    "disabled_blocked": disabled_blocked,
+                }
 
                 if conflict_with_merged or conflict_with_db:
-                    conflict_info = {
-                        "code": code,
-                        "index": idx,
-                        "strategy": conflict_strategy,
-                        "incoming_rule": {
-                            "code": code,
-                            "name": rule_data.get("name"),
-                            "priority": rule_data.get("priority", 0),
-                            "category": rule_data.get("category", "general"),
-                            "is_enabled": rule_data.get("is_enabled", True),
-                            "match_pattern": rule_data.get("match_pattern"),
-                        },
-                        "existing_rule": conflict_with_merged or {"code": code, "source_layer": "runtime"},
-                    }
+                    results["conflict_rules"].append(detail_entry)
 
                     if conflict_strategy == "skip":
                         results["skipped_count"] += 1
-                        conflict_info["action"] = "skipped"
-                        conflict_info["reason"] = (
+                        detail_entry["action"] = "skipped"
+                        detail_entry["reason"] = (
                             f"来源 code='{code}' 已存在"
                             f" (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'}"
                             f", 名称: {conflict_with_merged['name'] if conflict_with_merged else code})"
                             f"，跳过导入"
                         )
-                        results["conflicts"].append(conflict_info)
+                        results["skipped_rules"].append(detail_entry)
                         logger.info(json.dumps({
                             "event": "source_rule_import_skip",
                             "code": code,
                             "existing_layer": conflict_with_merged["source_layer"] if conflict_with_merged else "runtime",
+                            "operator": operator,
+                            "dry_run": dry_run,
                         }, ensure_ascii=False))
                         continue
 
                     elif conflict_strategy == "overwrite":
                         if not conflict_with_db:
                             results["skipped_count"] += 1
-                            conflict_info["action"] = "skipped_not_runtime"
-                            conflict_info["reason"] = (
+                            detail_entry["action"] = "skipped_not_runtime"
+                            detail_entry["reason"] = (
                                 f"来源 code='{code}' 存在于 {conflict_with_merged['source_layer']} 层"
                                 f" 但不在 runtime 层，无法覆盖，跳过"
                             )
-                            results["conflicts"].append(conflict_info)
+                            results["skipped_rules"].append(detail_entry)
                             results["errors"].append(
                                 f"规则 {code} 存在于 {conflict_with_merged['source_layer']} 层"
                                 f" 但不在 runtime 数据库中，无法覆盖"
@@ -1012,53 +1084,54 @@ class SourceRuleService:
                                 "event": "source_rule_import_skip_not_runtime",
                                 "code": code,
                                 "existing_layer": conflict_with_merged["source_layer"],
+                                "operator": operator,
+                                "dry_run": dry_run,
                             }, ensure_ascii=False))
                             continue
 
                         if dry_run:
-                            conflict_info["action"] = "would_overwrite"
-                            conflict_info["reason"] = "dry_run模式，仅预览不会实际覆盖"
-                            results["conflicts"].append(conflict_info)
+                            detail_entry["action"] = "would_overwrite"
+                            detail_entry["reason"] = "dry_run模式，仅预览不会实际覆盖"
+                            results["overwritten_rules"].append(detail_entry)
+                            results["overwritten_count"] += 1
                             results["success_count"] += 1
                             continue
 
                         try:
-                            before_row = conn_inner.execute(
-                                "SELECT * FROM source_rules WHERE code = ?", (code,)
-                            ).fetchone()
-                            before_data = dict(before_row) if before_row else None
-                            if before_data:
-                                before_data["is_enabled"] = bool(before_data["is_enabled"])
-
+                            before_data = existing_db_rule
                             updated = SourceRuleService.update_rule(
                                 code=code,
                                 name=rule_data.get("name"),
                                 description=rule_data.get("description"),
                                 category=rule_data.get("category"),
                                 priority=rule_data.get("priority", 0),
-                                is_enabled=rule_data.get("is_enabled", True),
+                                is_enabled=is_enabled_incoming,
                                 match_pattern=rule_data.get("match_pattern"),
                                 conn=conn_inner,
                             )
                             results["success_count"] += 1
-                            conflict_info["action"] = "overwritten"
-                            conflict_info["reason"] = (
+                            results["overwritten_count"] += 1
+                            detail_entry["action"] = "overwritten"
+                            detail_entry["reason"] = (
                                 f"已存在(层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'})，"
                                 f"覆盖更新; 变更: "
-                                f"name={before_data.get('name') if before_data else None}->{rule_data.get('name')}, "
-                                f"priority={before_data.get('priority') if before_data else None}->{rule_data.get('priority', 0)}, "
-                                f"category={before_data.get('category') if before_data else None}->{rule_data.get('category', 'general')}"
+                                f"name={before_data.get('name')}->{rule_data.get('name')}, "
+                                f"priority={before_data.get('priority')}->{rule_data.get('priority', 0)}, "
+                                f"category={before_data.get('category')}->{rule_data.get('category', 'general')}, "
+                                f"is_enabled={before_data.get('is_enabled')}->{is_enabled_incoming}"
                             )
-                            conflict_info["before"] = before_data
-                            conflict_info["after"] = updated.to_dict()
-                            results["conflicts"].append(conflict_info)
+                            detail_entry["before"] = before_data
+                            detail_entry["after"] = updated.to_dict()
+                            results["overwritten_rules"].append(detail_entry)
                             results["imported_rules"].append(updated.to_dict())
-                            existing_db_codes.add(code)
+                            existing_db_codes[code] = updated.to_dict()
                             logger.info(json.dumps({
                                 "event": "source_rule_import_overwrite",
                                 "code": code,
                                 "before": before_data,
                                 "after": updated.to_dict(),
+                                "operator": operator,
+                                "dry_run": dry_run,
                             }, ensure_ascii=False))
                             continue
                         except ValueError as e:
@@ -1070,14 +1143,14 @@ class SourceRuleService:
 
                     elif conflict_strategy == "report":
                         results["error_count"] += 1
-                        conflict_info["action"] = "reported"
-                        conflict_info["reason"] = (
+                        detail_entry["action"] = "reported"
+                        detail_entry["reason"] = (
                             f"来源 code='{code}' 已存在"
                             f" (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'}"
                             f", 名称: {conflict_with_merged['name'] if conflict_with_merged else code})"
                             f"，冲突策略为 report，导入失败"
                         )
-                        results["conflicts"].append(conflict_info)
+                        results["conflict_rules"][-1]["action"] = "reported"
                         results["errors"].append(
                             f"规则 {code} 已存在 (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'})，"
                             f"冲突策略为 report，导入失败"
@@ -1086,12 +1159,20 @@ class SourceRuleService:
 
                 if dry_run:
                     results["success_count"] += 1
+                    results["new_count"] += 1
+                    new_entry = {
+                        **detail_entry,
+                        "action": "would_create",
+                        "reason": "dry_run模式，仅预览不会实际创建",
+                        "dry_run": True,
+                    }
+                    results["new_rules"].append(new_entry)
                     results["imported_rules"].append({
                         "code": code,
                         "name": rule_data.get("name"),
                         "category": rule_data.get("category", "general"),
                         "priority": rule_data.get("priority", 0),
-                        "is_enabled": rule_data.get("is_enabled", True),
+                        "is_enabled": is_enabled_incoming,
                         "match_pattern": rule_data.get("match_pattern"),
                         "dry_run": True,
                     })
@@ -1104,16 +1185,27 @@ class SourceRuleService:
                         description=rule_data.get("description"),
                         category=rule_data.get("category", "general"),
                         priority=rule_data.get("priority", 0),
-                        is_enabled=rule_data.get("is_enabled", True),
+                        is_enabled=is_enabled_incoming,
                         match_pattern=rule_data.get("match_pattern"),
                         conn=conn_inner,
                     )
                     results["success_count"] += 1
+                    results["new_count"] += 1
+                    new_entry = {
+                        **detail_entry,
+                        "action": "created",
+                        "reason": "成功创建新规则",
+                        "after": created.to_dict(),
+                    }
+                    results["new_rules"].append(new_entry)
                     results["imported_rules"].append(created.to_dict())
-                    existing_db_codes.add(code)
+                    existing_db_codes[code] = created.to_dict()
                     logger.info(json.dumps({
                         "event": "source_rule_import_created",
                         "code": code,
+                        "rule": created.to_dict(),
+                        "operator": operator,
+                        "dry_run": dry_run,
                     }, ensure_ascii=False))
                 except ValueError as e:
                     results["error_count"] += 1
@@ -1123,33 +1215,48 @@ class SourceRuleService:
 
             results["success"] = results["error_count"] == 0
 
-            if not dry_run:
-                details_json = json.dumps({
-                    "conflicts": results["conflicts"],
-                    "errors": results["errors"],
-                }, ensure_ascii=False)
+            result_summary = (
+                f"导入完成: 成功{results['success_count']}条 "
+                f"(新增{results['new_count']}条, 覆盖{results['overwritten_count']}条), "
+                f"跳过{results['skipped_count']}条, "
+                f"失败{results['error_count']}条, "
+                f"禁用拦截{results['disabled_blocked_count']}条"
+                f"{' (dry_run预览)' if dry_run else ''}"
+            )
+            results["result_summary"] = result_summary
 
-                result_summary = (
-                    f"导入完成: 成功{results['success_count']}条, "
-                    f"跳过{results['skipped_count']}条, "
-                    f"失败{results['error_count']}条"
-                    f"{' (dry_run)' if dry_run else ''}"
-                )
+            if not dry_run:
+                effective_rules = [r["code"] for r in results["new_rules"] + results["overwritten_rules"]]
+                details_json = json.dumps({
+                    "new_rules": results["new_rules"],
+                    "overwritten_rules": results["overwritten_rules"],
+                    "skipped_rules": results["skipped_rules"],
+                    "conflict_rules": results["conflict_rules"],
+                    "disabled_blocked_rules": results["disabled_blocked_rules"],
+                    "invalid_rules": results["invalid_rules"],
+                    "errors": results["errors"],
+                    "effective_rules": effective_rules,
+                }, ensure_ascii=False)
 
                 conn_inner.execute(
                     """INSERT INTO source_rules_import_log
                        (import_version, rules_count, success_count, skipped_count, 
-                        error_count, conflict_strategy, result_summary, details_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        error_count, new_count, overwritten_count, disabled_blocked_count,
+                        conflict_strategy, result_summary, details_json, operator, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         SourceRuleService.RULES_VERSION,
                         results["rules_count"],
                         results["success_count"],
                         results["skipped_count"],
                         results["error_count"],
+                        results["new_count"],
+                        results["overwritten_count"],
+                        results["disabled_blocked_count"],
                         conflict_strategy,
                         result_summary,
                         details_json,
+                        operator,
                         now,
                     ),
                 )
@@ -1158,14 +1265,20 @@ class SourceRuleService:
                     "event": "source_rules_import_completed",
                     "summary": result_summary,
                     "success_count": results["success_count"],
+                    "new_count": results["new_count"],
+                    "overwritten_count": results["overwritten_count"],
                     "skipped_count": results["skipped_count"],
                     "error_count": results["error_count"],
+                    "disabled_blocked_count": results["disabled_blocked_count"],
                     "conflict_strategy": conflict_strategy,
+                    "effective_rules": effective_rules,
+                    "operator": operator,
                     "dry_run": dry_run,
                 }, ensure_ascii=False))
 
                 if results["success_count"] > 0 or results["skipped_count"] > 0:
                     SourceRuleService._invalidate_cache()
+                    SourceRuleService.ensure_cache_fresh()
 
             return results
 
@@ -1198,6 +1311,8 @@ class SourceRuleService:
                     "match_pattern": r.match_pattern,
                     "version": r.version,
                     "source_layer": r.source_layer,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
                 }
 
             export_data = {
@@ -1230,6 +1345,7 @@ class SourceRuleService:
             "version": SourceRuleService.RULES_VERSION,
             "exported_at": now_str(),
             "include_all_layers": False,
+            "only_enabled": only_enabled,
             "count": len(rules),
             "rules": [
                 {
@@ -1241,6 +1357,8 @@ class SourceRuleService:
                     "is_enabled": r.is_enabled,
                     "match_pattern": r.match_pattern,
                     "version": r.version,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
                 }
                 for r in rules
             ],
@@ -1254,13 +1372,59 @@ class SourceRuleService:
         return export_data
 
     @staticmethod
-    def get_import_history(limit: int = 20, conn=None) -> List[Dict[str, Any]]:
+    def export_rules_csv(only_enabled: bool = True, conn=None) -> str:
+        rules = SourceRuleService.get_runtime_rules(conn)
+
+        if only_enabled:
+            rules = [r for r in rules if r.is_enabled]
+
+        headers = [
+            "code", "name", "description", "category", "priority",
+            "is_enabled", "match_pattern", "version", "created_at", "updated_at"
+        ]
+        header_line = ",".join(headers)
+
+        lines = [header_line]
+        for r in rules:
+            row = [
+                f'"{r.code}"',
+                f'"{r.name}"',
+                f'"{r.description or ""}"',
+                f'"{r.category}"',
+                str(r.priority),
+                str(r.is_enabled).lower(),
+                f'"{r.match_pattern or ""}"',
+                f'"{r.version}"',
+                f'"{r.created_at or ""}"',
+                f'"{r.updated_at or ""}"',
+            ]
+            lines.append(",".join(row))
+
+        csv_content = "\n".join(lines)
+
+        logger.info(json.dumps({
+            "event": "source_rules_exported_csv",
+            "count": len(rules),
+            "only_enabled": only_enabled,
+        }, ensure_ascii=False))
+
+        return csv_content
+
+    @staticmethod
+    def get_import_history(limit: int = 20, import_id: int = None, conn=None) -> List[Dict[str, Any]]:
         if conn is None:
             conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM source_rules_import_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+
+        if import_id:
+            rows = conn.execute(
+                "SELECT * FROM source_rules_import_log WHERE id = ? ORDER BY id DESC",
+                (import_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM source_rules_import_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
         history = []
         for row in rows:
@@ -1270,6 +1434,34 @@ class SourceRuleService:
             except json.JSONDecodeError:
                 entry["details"] = None
             entry.pop("details_json", None)
+
+            if entry.get("details"):
+                details = entry["details"]
+                summary = {
+                    "new_count": entry.get("new_count", 0),
+                    "overwritten_count": entry.get("overwritten_count", 0),
+                    "skipped_count": entry.get("skipped_count", 0),
+                    "error_count": entry.get("error_count", 0),
+                    "disabled_blocked_count": entry.get("disabled_blocked_count", 0),
+                    "effective_rules": details.get("effective_rules", []),
+                    "new_rules": [
+                        {"code": r.get("code"), "name": r.get("incoming_rule", {}).get("name")}
+                        for r in details.get("new_rules", [])
+                    ],
+                    "overwritten_rules": [
+                        {"code": r.get("code"), "name": r.get("incoming_rule", {}).get("name")}
+                        for r in details.get("overwritten_rules", [])
+                    ],
+                }
+                entry["summary"] = summary
+
             history.append(entry)
+
+        logger.info(json.dumps({
+            "event": "source_rules_import_history_query",
+            "count": len(history),
+            "limit": limit,
+            "import_id": import_id,
+        }, ensure_ascii=False))
 
         return history
