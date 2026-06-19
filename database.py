@@ -16,7 +16,7 @@ _local = threading.local()
 
 def get_db():
     if not hasattr(_local, "conn"):
-        _local.conn = sqlite3.connect(str(DB_PATH))
+        _local.conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA foreign_keys = ON")
         _local.conn.execute("PRAGMA journal_mode = WAL")
@@ -152,10 +152,34 @@ def init_db():
     _init_source_rules_import_log_table(cur)
     _init_source_rules_audit_log_table(cur)
     _init_import_replay_tables(cur)
+    _init_source_rules_lineage_table(cur)
     _init_default_config(cur)
     _init_default_source_rules(cur)
 
     conn.commit()
+
+
+def _init_source_rules_lineage_table(cur):
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS source_rules_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_code TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        operator TEXT,
+        import_job_id INTEGER,
+        snapshot_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        parent_lineage_id INTEGER,
+        remark TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lineage_rule_code ON source_rules_lineage(rule_code);
+    CREATE INDEX IF NOT EXISTS idx_lineage_source_type ON source_rules_lineage(source_type);
+    CREATE INDEX IF NOT EXISTS idx_lineage_import_job ON source_rules_lineage(import_job_id);
+    CREATE INDEX IF NOT EXISTS idx_lineage_created ON source_rules_lineage(created_at);
+    CREATE INDEX IF NOT EXISTS idx_lineage_parent ON source_rules_lineage(parent_lineage_id);
+    """)
 
 
 def _init_default_config(cur):
@@ -166,6 +190,8 @@ def _init_default_config(cur):
         ("makeup_default_remark", "线下窗口补录", "补录默认备注"),
         ("makeup_allow_revoke", "true", "是否允许撤销补录"),
         ("makeup_revoke_deadline_hours", "24", "补录后允许撤销的小时数"),
+        ("import_audit_require_permission", "true", "导入审计是否需要权限验证"),
+        ("import_audit_default_admin", "admin", "默认拥有全部导入审计权限的用户ID"),
     ]
     now = now_str()
     for key, value, desc in defaults:
@@ -383,6 +409,9 @@ def _init_import_replay_tables(cur):
     CREATE INDEX IF NOT EXISTS idx_import_permissions_user ON source_rules_import_permissions(user_id);
     CREATE INDEX IF NOT EXISTS idx_import_permissions_type ON source_rules_import_permissions(permission_type);
     """)
+
+    _add_column_if_not_exists(cur, "source_rules_import_jobs", "dry_run", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_not_exists(cur, "source_rules_import_conflicts", "content_hash", "TEXT")
 
 
 def _init_default_source_rules(cur):
