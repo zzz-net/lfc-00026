@@ -1595,6 +1595,228 @@ def test_17_e2e_chain(ctx):
 
 
 # ============================================================
+# Test 18: Unmatched source rejection
+# ============================================================
+
+def test_18_unmatched_source_rejection(ctx):
+    print_section("测试 18: 未匹配来源拒绝")
+
+    ok = True
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR001",
+        "menu_item_id": ctx["item1_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "totally_unknown_source",
+        "remark": "测试未知来源",
+    })
+    print_test("未知来源返回400", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+    else:
+        body = safe_json(r)
+        err_info = body.get("detail", body)
+        err_code = err_info.get("code", "")
+        err_msg = err_info.get("message", "") or err_info.get("detail", "")
+        print_test("错误码为UNMATCHED_SOURCE", err_code == "UNMATCHED_SOURCE",
+                   f"code={err_code}")
+        print_test("错误信息包含来源名", "totally_unknown_source" in str(err_msg),
+                   f"msg={str(err_msg)[:200]}")
+        print_test("错误信息包含允许列表", "允许的来源" in str(err_msg),
+                   f"msg含允许列表={'允许的来源' in str(err_msg)}")
+        if err_code != "UNMATCHED_SOURCE" or "totally_unknown_source" not in str(err_msg):
+            ok = False
+
+    r = api("GET", "/api/admin/orders/makeup", params={"source": "totally_unknown_source"})
+    data = r.json()
+    print_test("未知来源未入库", data.get("total", 0) == 0,
+               f"total={data.get('total', 0)}")
+    if data.get("total", 0) != 0:
+        ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR001",
+        "menu_item_id": ctx["item1_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "random_nonsense_42",
+    })
+    print_test("另一个未知来源也返回400", r.status_code == 400,
+               f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+
+    r = api("GET", "/api/admin/orders/makeup", params={"source": "random_nonsense_42"})
+    data = r.json()
+    print_test("另一个未知来源也未入库", data.get("total", 0) == 0,
+               f"total={data.get('total', 0)}")
+    if data.get("total", 0) != 0:
+        ok = False
+
+    r = api("GET", "/api/admin/orders/makeup")
+    data = r.json()
+    null_rule_orders = [
+        item for item in data.get("items", [])
+        if item.get("matched_source_rule") is None and item.get("source") != "normal"
+    ]
+    print_test("无matched_source_rule为null的有效补录", len(null_rule_orders) == 0,
+               f"null_rule_count={len(null_rule_orders)}")
+    if len(null_rule_orders) != 0:
+        ok = False
+
+    print_test("未匹配来源拒绝总结果", ok)
+
+
+# ============================================================
+# Test 19: Disabled source rule returns correct error code
+# ============================================================
+
+def test_19_disabled_rule_error_code(ctx):
+    print_section("测试 19: 禁用规则返回明确错误码")
+
+    ok = True
+
+    r = api("POST", "/api/admin/source-rules", json={
+        "code": "disabled_err_test",
+        "name": "禁用错误码测试",
+        "category": "general",
+        "priority": 20,
+        "is_enabled": True,
+    })
+    if r.status_code != 200:
+        print_test("创建禁用测试规则", False, f"状态码 {r.status_code}")
+        ok = False
+        return
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR001",
+        "menu_item_id": ctx["item3_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "disabled_err_test",
+    }, headers={"x_idempotency_key": f"disabled_err_{ctx['today']}"})
+    print_test("启用时可正常补录", r.status_code == 200, f"状态码 {r.status_code}")
+    if r.status_code != 200:
+        ok = False
+
+    api("PATCH", "/api/admin/source-rules/disabled_err_test", json={"is_enabled": False})
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR001",
+        "menu_item_id": ctx["item1_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "disabled_err_test",
+    })
+    print_test("禁用后返回400", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+    else:
+        body = safe_json(r)
+        err_info = body.get("detail", body)
+        err_code = err_info.get("code", "")
+        err_msg = err_info.get("message", "") or err_info.get("detail", "")
+        print_test("错误码为DISABLED_SOURCE_RULE", err_code == "DISABLED_SOURCE_RULE",
+                   f"code={err_code}")
+        print_test("错误信息提到规则已禁用", "已禁用" in str(err_msg),
+                   f"msg={str(err_msg)[:200]}")
+        if err_code != "DISABLED_SOURCE_RULE":
+            ok = False
+
+    r = api("GET", "/api/admin/orders/makeup", params={"source": "disabled_err_test"})
+    data = r.json()
+    print_test("禁用来源仅有1条历史记录", data.get("total", 0) == 1,
+               f"total={data.get('total', 0)}")
+    if data.get("total", 0) != 1:
+        ok = False
+
+    print_test("禁用规则错误码总结果", ok)
+
+
+# ============================================================
+# Test 20: Reboot consistency — no null matched_source_rule
+# ============================================================
+
+def test_20_reboot_no_null_matched_rule(ctx, process):
+    print_section("测试 20: 重启后无null matched_source_rule的有效补录")
+
+    ok = True
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR001",
+        "menu_item_id": ctx["item1_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "admin",
+    })
+    print_test("重启前创建有效补录", r.status_code == 200, f"状态码 {r.status_code}")
+    if r.status_code != 200:
+        ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR002",
+        "menu_item_id": ctx["item2_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "nonexistent_reboot_test",
+    })
+    print_test("重启前未知来源被拒", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+
+    orders_before = api("GET", "/api/admin/orders/makeup").json()
+    before_total = orders_before.get("total", 0)
+    before_null = [
+        item for item in orders_before.get("items", [])
+        if item.get("matched_source_rule") is None and item.get("source") != "normal"
+    ]
+    print(f"  重启前: 补录总数={before_total}, null_rule数={len(before_null)}")
+
+    stop_service(process)
+    time.sleep(2)
+
+    env_rules = json.dumps([
+        {"code": "env_test", "name": "环境变量测试来源", "priority": 95, "is_enabled": True},
+        {"code": "window", "name": "环境变量覆盖的窗口", "priority": 150, "is_enabled": True},
+    ])
+    process = start_service(extra_env={"CANTEEN_SOURCE_RULES": env_rules})
+    wait_for_service()
+
+    orders_after = api("GET", "/api/admin/orders/makeup").json()
+    after_total = orders_after.get("total", 0)
+    after_null = [
+        item for item in orders_after.get("items", [])
+        if item.get("matched_source_rule") is None and item.get("source") != "normal"
+    ]
+    print(f"  重启后: 补录总数={after_total}, null_rule数={len(after_null)}")
+
+    print_test("重启后补录总数一致", after_total == before_total,
+               f"前={before_total}, 后={after_total}")
+    if after_total != before_total:
+        ok = False
+
+    print_test("重启后无null matched_source_rule", len(after_null) == 0,
+               f"null_count={len(after_null)}")
+    if len(after_null) != 0:
+        ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR003",
+        "menu_item_id": ctx["item3_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "nonexistent_after_reboot",
+    })
+    print_test("重启后未知来源仍被拒", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+
+    print_test("重启后无null matched_source_rule总结果", ok)
+    return process
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1645,7 +1867,9 @@ def main():
         test_14_priority_override(ctx)
         test_16_audit_log(ctx)
         test_17_e2e_chain(ctx)
-        process = test_15_reboot_consistency(ctx, process)
+        test_18_unmatched_source_rejection(ctx)
+        test_19_disabled_rule_error_code(ctx)
+        process = test_20_reboot_no_null_matched_rule(ctx, process)
 
     except Exception as e:
         print(f"\n  [FATAL] 测试执行出错: {e}")

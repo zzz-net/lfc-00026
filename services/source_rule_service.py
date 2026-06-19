@@ -468,6 +468,12 @@ class SourceRuleService:
 
         rule = SourceRuleService.match_source(source_code, conn)
         if rule:
+            if not rule.is_enabled:
+                return True, None, rule
+            return True, None, rule
+
+        rule = SourceRuleService.get_rule_by_code(source_code, conn)
+        if rule:
             return True, None, rule
 
         allowed = SourceRuleService.get_allowed_sources(conn)

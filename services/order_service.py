@@ -255,15 +255,24 @@ class OrderService:
 
         detected_source, matched_rule = SourceRuleService.detect_source(source, remark, conn=get_db())
 
-        if source and source != detected_source:
-            is_valid, error_msg, rule_from_validate = SourceRuleService.validate_source(source)
-            if not is_valid:
+        if source and not matched_rule:
+            _, _, rule_from_validate = SourceRuleService.validate_source(source, conn=get_db())
+            if rule_from_validate and not rule_from_validate.is_enabled:
                 logger.warning(json.dumps({
-                    "event": "makeup_source_validation_failed",
+                    "event": "makeup_source_rule_disabled",
                     "source": source,
-                    "error": error_msg,
+                    "rule_code": rule_from_validate.code,
+                    "rule_name": rule_from_validate.name,
                 }, ensure_ascii=False))
-                raise ValueError(error_msg)
+                raise ValueError(f"来源规则 {rule_from_validate.code} 已禁用，无法用于补录")
+            if not rule_from_validate:
+                allowed = SourceRuleService.get_allowed_sources(conn=get_db())
+                logger.warning(json.dumps({
+                    "event": "makeup_source_unmatched",
+                    "source": source,
+                    "allowed_sources": allowed,
+                }, ensure_ascii=False))
+                raise ValueError(f"补录来源 '{source}' 未命中任何来源规则，允许的来源: {', '.join(allowed)}")
             matched_rule = rule_from_validate
             detected_source = source
 
@@ -275,17 +284,6 @@ class OrderService:
                 "rule_name": matched_rule.name,
             }, ensure_ascii=False))
             raise ValueError(f"来源规则 {matched_rule.code} 已禁用，无法用于补录")
-
-        if not matched_rule and source:
-            disabled_rule = SourceRuleService.get_rule_by_code(source, conn=get_db())
-            if disabled_rule and not disabled_rule.is_enabled:
-                logger.warning(json.dumps({
-                    "event": "makeup_source_rule_disabled",
-                    "source": source,
-                    "rule_code": disabled_rule.code,
-                    "rule_name": disabled_rule.name,
-                }, ensure_ascii=False))
-                raise ValueError(f"来源规则 {disabled_rule.code} 已禁用，无法用于补录")
 
         source = detected_source
         remark = remark or default_remark
