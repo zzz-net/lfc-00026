@@ -1,5 +1,5 @@
 import logging
-from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Header, Query, UploadFile, File, Request, Depends
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
@@ -186,6 +186,45 @@ class GrantImportPermissionRequest(BaseModel):
 
 def error_response(message: str, code: str = "BAD_REQUEST", status_code: int = 400):
     raise HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
+# ========== 统一鉴权守卫 ==========
+
+
+def get_permission_message(permission_type: str) -> str:
+    permission_messages = {
+        "import_manage": "没有导入管理权限，无法执行导入操作",
+        "import_audit_view": "没有导入审计查看权限",
+        "import_audit_export": "没有导入审计导出权限",
+        "import_revoke": "没有撤销导入的权限",
+    }
+    return permission_messages.get(permission_type, "没有访问权限")
+
+
+def require_import_permission(permission_type: str):
+    def dependency(request: Request):
+        x_user_id = request.headers.get("x-user-id") or request.headers.get("X-User-Id")
+        if not x_user_id:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "UNAUTHORIZED",
+                    "message": "缺少身份认证信息，请提供 X-User-Id 请求头",
+                },
+            )
+        has_perm = SourceRuleService.check_import_audit_permission(
+            x_user_id, permission_type
+        )
+        if not has_perm:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": get_permission_message(permission_type),
+                },
+            )
+        return x_user_id
+    return dependency
 
 
 # ========== 管理员 - 员工管理 ==========
@@ -523,23 +562,9 @@ def admin_create_source_rule(
 def admin_import_source_rules(
     data: SourceRulesImportRequest,
     x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_manage")),
 ):
     try:
-        if x_user_id:
-            has_perm = SourceRuleService.check_import_audit_permission(
-                x_user_id, "import_manage"
-            )
-            if not has_perm:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "detail": {
-                            "code": "PERMISSION_DENIED",
-                            "message": "没有导入管理权限，无法执行导入操作",
-                        }
-                    },
-                )
         result = SourceRuleService.import_rules(
             rules_data=data.rules,
             conflict_strategy=data.conflict_strategy,
@@ -567,23 +592,9 @@ def admin_import_source_rules(
 def admin_import_source_rules_dry_run(
     data: SourceRulesImportRequest,
     x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_manage")),
 ):
     try:
-        if x_user_id:
-            has_perm = SourceRuleService.check_import_audit_permission(
-                x_user_id, "import_manage"
-            )
-            if not has_perm:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "detail": {
-                            "code": "PERMISSION_DENIED",
-                            "message": "没有导入管理权限，无法执行导入预检",
-                        }
-                    },
-                )
         result = SourceRuleService.import_rules(
             rules_data=data.rules,
             conflict_strategy=data.conflict_strategy,
@@ -600,44 +611,16 @@ def admin_import_source_rules_dry_run(
 def admin_export_source_rules_json(
     only_enabled: bool = Query(True, description="仅导出启用的规则"),
     include_all_layers: bool = Query(False, description="包含所有层级(default/environment/runtime)"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_export")),
 ):
-    if x_user_id:
-        has_perm = SourceRuleService.check_import_audit_permission(
-            x_user_id, "import_audit_export"
-        )
-        if not has_perm:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导出权限，无法导出来源规则",
-                    }
-                },
-            )
     return SourceRuleService.export_rules(only_enabled=only_enabled, include_all_layers=include_all_layers)
 
 
 @app.get("/api/admin/source-rules/export/csv", tags=["管理员"], summary="导出来源规则(CSV)")
 def admin_export_source_rules_csv(
     only_enabled: bool = Query(True, description="仅导出启用的规则"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_export")),
 ):
-    if x_user_id:
-        has_perm = SourceRuleService.check_import_audit_permission(
-            x_user_id, "import_audit_export"
-        )
-        if not has_perm:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导出权限，无法导出来源规则",
-                    }
-                },
-            )
     csv_content = SourceRuleService.export_rules_csv(only_enabled=only_enabled)
     filename = f"source_rules_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return PlainTextResponse(
@@ -648,7 +631,10 @@ def admin_export_source_rules_csv(
 
 
 @app.get("/api/admin/source-rules/import-history/{import_id}", tags=["管理员"], summary="获取单条导入历史详情")
-def admin_get_import_history_detail(import_id: int):
+def admin_get_import_history_detail(
+    import_id: int,
+    current_user: str = Depends(require_import_permission("import_audit_view")),
+):
     try:
         history = SourceRuleService.get_import_history(import_id=import_id)
         if not history:
@@ -662,6 +648,7 @@ def admin_get_import_history_detail(import_id: int):
 def admin_get_import_history(
     limit: int = Query(20, ge=1, le=100, description="返回条数"),
     operator: Optional[str] = Query(None, description="按操作人过滤"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         return SourceRuleService.get_import_history(limit=limit, operator=operator)
@@ -674,6 +661,7 @@ def admin_get_source_rules_audit_log(
     rule_code: Optional[str] = Query(None, description="按规则code过滤"),
     import_id: Optional[int] = Query(None, description="按导入批次ID过滤"),
     limit: int = Query(50, ge=1, le=200, description="返回条数"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         return SourceRuleService.get_audit_log(rule_code=rule_code, import_id=import_id, limit=limit)
@@ -746,11 +734,11 @@ def admin_list_import_jobs(
     end_time: Optional[str] = Query(None, description="结束时间 YYYY-MM-DD HH:MM:SS"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         return SourceRuleService.list_import_jobs(
-            user_id=x_user_id,
+            user_id=current_user,
             status=status,
             operator=operator,
             is_revoked=is_revoked,
@@ -766,21 +754,10 @@ def admin_list_import_jobs(
 @app.get("/api/admin/import-replay/jobs/{job_id}", tags=["导入回放中心"], summary="获取导入作业详情")
 def admin_get_import_job(
     job_id: str,
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
-        result = SourceRuleService.get_import_job(job_id, user_id=x_user_id)
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
+        result = SourceRuleService.get_import_job(job_id, user_id=current_user)
         return result
     except ValueError as e:
         error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
@@ -792,27 +769,16 @@ def admin_get_import_job_details(
     status_filter: Optional[str] = Query(None, description="按状态过滤: success/skipped/error"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=500, description="每页条数"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_import_job_details(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
             status_filter=status_filter,
             page=page,
             page_size=page_size,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
         return result
     except ValueError as e:
         error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
@@ -822,25 +788,14 @@ def admin_get_import_job_details(
 def admin_get_import_job_snapshots(
     job_id: str,
     snapshot_type: str = Query("before_import", description="快照类型: before_import/after_revoke"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_import_job_snapshots(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
             snapshot_type=snapshot_type,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
         return result
     except ValueError as e:
         error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
@@ -850,25 +805,14 @@ def admin_get_import_job_snapshots(
 def admin_get_import_job_conflicts(
     job_id: str,
     include_resolved: bool = Query(True, description="是否包含已解决的冲突"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_import_job_conflicts(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
             include_resolved=include_resolved,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
         return result
     except ValueError as e:
         error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
@@ -879,26 +823,15 @@ def admin_revoke_import_job(
     job_id: str,
     data: ImportRevokeRequest = None,
     x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_revoke")),
 ):
     try:
         result = SourceRuleService.revoke_import_job(
             job_id=job_id,
             operator=x_operator,
-            user_id=x_user_id,
+            user_id=current_user,
             reason=data.reason if data else None,
         )
-        if not result.get("has_revoke_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有撤销导入的权限，请联系管理员授权",
-                        **result,
-                    }
-                },
-            )
         if not result.get("success"):
             return JSONResponse(
                 status_code=400,
@@ -918,24 +851,13 @@ def admin_revoke_import_job(
 @app.get("/api/admin/import-replay/jobs/{job_id}/replay", tags=["导入回放中心"], summary="获取撤销后回放数据（验证撤销结果）")
 def admin_get_import_replay_data(
     job_id: str,
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_import_replay_data(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
         return result
     except ValueError as e:
         error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
@@ -945,25 +867,14 @@ def admin_get_import_replay_data(
 def admin_export_import_job_json(
     job_id: str,
     export_type: str = Query("full", description="导出类型: full/details/snapshots/conflicts/audit_log"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_export")),
 ):
     try:
         result = SourceRuleService.export_import_job_json(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
             export_type=export_type,
         )
-        if not result.get("has_export_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导出导入审计数据的权限",
-                        **result,
-                    }
-                },
-            )
         return JSONResponse(
             content=result["data"],
             headers={
@@ -978,25 +889,14 @@ def admin_export_import_job_json(
 def admin_export_import_job_csv(
     job_id: str,
     export_type: str = Query("details", description="导出类型: details/diff/conflicts"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_export")),
 ):
     try:
         result = SourceRuleService.export_import_job_csv(
             job_id=job_id,
-            user_id=x_user_id,
+            user_id=current_user,
             export_type=export_type,
         )
-        if not result.get("has_export_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导出导入审计数据的权限",
-                        **result,
-                    }
-                },
-            )
         return PlainTextResponse(
             content=result["data"],
             media_type="text/csv; charset=utf-8-sig",
@@ -1017,11 +917,11 @@ def admin_get_structured_audit_log(
     end_time: Optional[str] = Query(None, description="结束时间 YYYY-MM-DD HH:MM:SS"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=200, description="每页条数"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_structured_audit_log(
-            user_id=x_user_id,
+            user_id=current_user,
             job_id=job_id,
             rule_code=rule_code,
             operation=operation,
@@ -1030,17 +930,6 @@ def admin_get_structured_audit_log(
             page=page,
             page_size=page_size,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看敏感明细",
-                        **result,
-                    }
-                },
-            )
         return result
     except Exception as e:
         error_response(str(e), "AUDIT_LOG_ERROR", 400)
@@ -1069,28 +958,17 @@ def admin_get_rule_lineage(
     source_type: Optional[str] = Query(None, description="按来源类型过滤: manual_create/import_create/manual_update/import_overwrite/revoke_restore/revoke_delete"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=200, description="每页条数"),
-    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+    current_user: str = Depends(require_import_permission("import_audit_view")),
 ):
     try:
         result = SourceRuleService.get_rule_lineage(
             rule_code=rule_code,
             import_job_id=import_job_id,
             source_type=source_type,
-            user_id=x_user_id,
+            user_id=current_user,
             page=page,
             page_size=page_size,
         )
-        if not result.get("has_audit_permission"):
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": {
-                        "code": "PERMISSION_DENIED",
-                        "message": "没有导入审计权限，无法查看溯源链",
-                        **result,
-                    }
-                },
-            )
         return result
     except Exception as e:
         error_response(str(e), "LINEAGE_ERROR", 400)
