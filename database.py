@@ -150,6 +150,7 @@ def init_db():
 
     _init_source_rules_table(cur)
     _init_source_rules_import_log_table(cur)
+    _init_source_rules_audit_log_table(cur)
     _init_default_config(cur)
     _init_default_source_rules(cur)
 
@@ -208,6 +209,7 @@ def _init_source_rules_table(cur):
         code TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
         description TEXT,
+        category TEXT NOT NULL DEFAULT 'general',
         priority INTEGER NOT NULL DEFAULT 0,
         is_enabled INTEGER NOT NULL DEFAULT 1,
         match_pattern TEXT,
@@ -219,6 +221,28 @@ def _init_source_rules_table(cur):
     CREATE INDEX IF NOT EXISTS idx_source_rules_code ON source_rules(code);
     CREATE INDEX IF NOT EXISTS idx_source_rules_priority ON source_rules(priority);
     CREATE INDEX IF NOT EXISTS idx_source_rules_enabled ON source_rules(is_enabled);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_category ON source_rules(category);
+    """)
+
+    _add_column_if_not_exists(cur, "source_rules", "category", "TEXT NOT NULL DEFAULT 'general'")
+
+
+def _init_source_rules_audit_log_table(cur):
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS source_rules_audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_code TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        operator TEXT,
+        before_json TEXT,
+        after_json TEXT,
+        remark TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_source_rules_audit_code ON source_rules_audit_log(rule_code);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_audit_op ON source_rules_audit_log(operation);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_audit_created ON source_rules_audit_log(created_at);
     """)
 
 
@@ -245,6 +269,7 @@ def _init_default_source_rules(cur):
             "code": "window",
             "name": "线下窗口",
             "description": "食堂窗口人工补录",
+            "category": "onsite",
             "priority": 100,
             "is_enabled": 1,
             "match_pattern": None,
@@ -253,6 +278,7 @@ def _init_default_source_rules(cur):
             "code": "admin",
             "name": "管理员后台",
             "description": "管理员在后台系统补录",
+            "category": "system",
             "priority": 90,
             "is_enabled": 1,
             "match_pattern": None,
@@ -261,9 +287,28 @@ def _init_default_source_rules(cur):
             "code": "manual",
             "name": "手动导入",
             "description": "通过批量导入方式补录",
+            "category": "import",
             "priority": 80,
             "is_enabled": 1,
             "match_pattern": None,
+        },
+        {
+            "code": "phone_order",
+            "name": "电话订餐",
+            "description": "通过电话方式补录的订单",
+            "category": "remote",
+            "priority": 70,
+            "is_enabled": 1,
+            "match_pattern": "^phone_.*",
+        },
+        {
+            "code": "pos",
+            "name": "POS终端",
+            "description": "POS终端设备自动补录",
+            "category": "system",
+            "priority": 85,
+            "is_enabled": 1,
+            "match_pattern": "^pos_.*",
         },
     ]
 
@@ -271,12 +316,13 @@ def _init_default_source_rules(cur):
     for rule in defaults:
         cur.execute(
             """INSERT OR IGNORE INTO source_rules 
-               (code, name, description, priority, is_enabled, match_pattern, version, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (code, name, description, category, priority, is_enabled, match_pattern, version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rule["code"],
                 rule["name"],
                 rule["description"],
+                rule.get("category", "general"),
                 rule["priority"],
                 rule["is_enabled"],
                 rule["match_pattern"],

@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logging.getLogger("services.source_rule_service").setLevel(logging.WARNING)
+logging.getLogger("services.source_rule_service").setLevel(logging.INFO)
 
 app = FastAPI(
     title="食堂订餐扣费系统",
@@ -117,6 +117,7 @@ class SourceRuleCreate(BaseModel):
     code: str
     name: str
     description: Optional[str] = None
+    category: str = "general"
     priority: int = 0
     is_enabled: bool = True
     match_pattern: Optional[str] = None
@@ -125,6 +126,7 @@ class SourceRuleCreate(BaseModel):
 class SourceRuleUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    category: Optional[str] = None
     priority: Optional[int] = None
     is_enabled: Optional[bool] = None
     match_pattern: Optional[str] = None
@@ -133,6 +135,7 @@ class SourceRuleUpdate(BaseModel):
 class SourceRulesImportRequest(BaseModel):
     rules: List[dict]
     conflict_strategy: str = "skip"
+    dry_run: bool = False
 
 
 # ========== Error Helper ==========
@@ -425,6 +428,7 @@ def admin_create_source_rule(data: SourceRuleCreate):
             code=data.code,
             name=data.name,
             description=data.description,
+            category=data.category,
             priority=data.priority,
             is_enabled=data.is_enabled,
             match_pattern=data.match_pattern,
@@ -432,7 +436,7 @@ def admin_create_source_rule(data: SourceRuleCreate):
         return rule.to_dict()
     except ValueError as e:
         msg = str(e)
-        if "已存在" in msg:
+        if "已存在" in msg or "已存在" in msg:
             error_response(msg, "SOURCE_RULE_EXISTS", 409)
         else:
             error_response(msg, "SOURCE_RULE_VALIDATION_ERROR", 400)
@@ -444,6 +448,7 @@ def admin_import_source_rules(data: SourceRulesImportRequest):
         result = SourceRuleService.import_rules(
             rules_data=data.rules,
             conflict_strategy=data.conflict_strategy,
+            dry_run=data.dry_run,
         )
         if not result["success"]:
             return JSONResponse(
@@ -464,8 +469,9 @@ def admin_import_source_rules(data: SourceRulesImportRequest):
 @app.get("/api/admin/source-rules/export/json", tags=["管理员"], summary="导出来源规则(JSON)")
 def admin_export_source_rules_json(
     only_enabled: bool = Query(True, description="仅导出启用的规则"),
+    include_all_layers: bool = Query(False, description="包含所有层级(default/environment/runtime)"),
 ):
-    return SourceRuleService.export_rules(only_enabled=only_enabled)
+    return SourceRuleService.export_rules(only_enabled=only_enabled, include_all_layers=include_all_layers)
 
 
 @app.get("/api/admin/source-rules/import-history", tags=["管理员"], summary="获取导入历史")
@@ -474,6 +480,17 @@ def admin_get_import_history(
 ):
     try:
         return SourceRuleService.get_import_history(limit=limit)
+    except Exception as e:
+        error_response(str(e), "SOURCE_RULE_ERROR", 400)
+
+
+@app.get("/api/admin/source-rules/audit-log", tags=["管理员"], summary="获取来源规则审计日志")
+def admin_get_source_rules_audit_log(
+    rule_code: Optional[str] = Query(None, description="按规则code过滤"),
+    limit: int = Query(50, ge=1, le=200, description="返回条数"),
+):
+    try:
+        return SourceRuleService.get_audit_log(rule_code=rule_code, limit=limit)
     except Exception as e:
         error_response(str(e), "SOURCE_RULE_ERROR", 400)
 
@@ -496,6 +513,7 @@ def admin_update_source_rule(code: str, data: SourceRuleUpdate):
             code=code,
             name=data.name,
             description=data.description,
+            category=data.category,
             priority=data.priority,
             is_enabled=data.is_enabled,
             match_pattern=data.match_pattern,

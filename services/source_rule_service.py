@@ -10,6 +10,8 @@ from database import get_db, transaction, now_str, SOURCE_RULES_VERSION
 
 logger = logging.getLogger(__name__)
 
+VALID_CATEGORIES = {"onsite", "system", "import", "remote", "general"}
+
 
 @dataclass
 class SourceRule:
@@ -17,6 +19,7 @@ class SourceRule:
     code: str
     name: str
     description: Optional[str]
+    category: str
     priority: int
     is_enabled: bool
     match_pattern: Optional[str]
@@ -31,6 +34,7 @@ class SourceRule:
             "code": self.code,
             "name": self.name,
             "description": self.description,
+            "category": self.category,
             "priority": self.priority,
             "is_enabled": self.is_enabled,
             "match_pattern": self.match_pattern,
@@ -54,13 +58,26 @@ class SourceRuleService:
     def _invalidate_cache():
         SourceRuleService._cache = {}
         SourceRuleService._cache_timestamp = 0
-        logger.info("[来源规则] 缓存已失效")
+        logger.info(json.dumps({
+            "event": "source_rule_cache_invalidated",
+            "timestamp": now_str(),
+        }, ensure_ascii=False))
+
+    @staticmethod
+    def ensure_cache_fresh():
+        SourceRuleService._invalidate_cache()
+        SourceRuleService.get_merged_rules()
+        logger.info(json.dumps({
+            "event": "source_rule_cache_freshened",
+            "timestamp": now_str(),
+        }, ensure_ascii=False))
 
     DEFAULT_RULES: List[Dict[str, Any]] = [
         {
             "code": "window",
             "name": "线下窗口",
             "description": "食堂窗口人工补录",
+            "category": "onsite",
             "priority": 100,
             "is_enabled": True,
             "match_pattern": None,
@@ -71,6 +88,7 @@ class SourceRuleService:
             "code": "admin",
             "name": "管理员后台",
             "description": "管理员在后台系统补录",
+            "category": "system",
             "priority": 90,
             "is_enabled": True,
             "match_pattern": None,
@@ -81,9 +99,32 @@ class SourceRuleService:
             "code": "manual",
             "name": "手动导入",
             "description": "通过批量导入方式补录",
+            "category": "import",
             "priority": 80,
             "is_enabled": True,
             "match_pattern": None,
+            "version": RULES_VERSION,
+            "source_layer": "default",
+        },
+        {
+            "code": "phone_order",
+            "name": "电话订餐",
+            "description": "通过电话方式补录的订单",
+            "category": "remote",
+            "priority": 70,
+            "is_enabled": True,
+            "match_pattern": "^phone_.*",
+            "version": RULES_VERSION,
+            "source_layer": "default",
+        },
+        {
+            "code": "pos",
+            "name": "POS终端",
+            "description": "POS终端设备自动补录",
+            "category": "system",
+            "priority": 85,
+            "is_enabled": True,
+            "match_pattern": "^pos_.*",
             "version": RULES_VERSION,
             "source_layer": "default",
         },
@@ -96,7 +137,11 @@ class SourceRuleService:
         try:
             rules = json.loads(env_value)
             if not isinstance(rules, list):
-                logger.warning(f"[来源规则] 环境变量规则格式错误，应为数组: {env_value}")
+                logger.warning(json.dumps({
+                    "event": "env_rules_parse_error",
+                    "reason": "not_array",
+                    "raw": env_value[:200],
+                }, ensure_ascii=False))
                 return []
             parsed_rules = []
             for r in rules:
@@ -106,10 +151,14 @@ class SourceRuleService:
                     "version": r.get("version", SourceRuleService.RULES_VERSION),
                     "is_enabled": r.get("is_enabled", True),
                     "priority": r.get("priority", 0),
+                    "category": r.get("category", "general"),
                 })
             return parsed_rules
         except json.JSONDecodeError as e:
-            logger.warning(f"[来源规则] 环境变量规则JSON解析失败: {e}")
+            logger.warning(json.dumps({
+                "event": "env_rules_json_error",
+                "error": str(e),
+            }, ensure_ascii=False))
             return []
 
     @staticmethod
@@ -120,6 +169,7 @@ class SourceRuleService:
                 code=r["code"],
                 name=r["name"],
                 description=r["description"],
+                category=r.get("category", "general"),
                 priority=r["priority"],
                 is_enabled=r["is_enabled"],
                 match_pattern=r["match_pattern"],
@@ -141,6 +191,7 @@ class SourceRuleService:
                 code=r["code"],
                 name=r.get("name", r["code"]),
                 description=r.get("description"),
+                category=r.get("category", "general"),
                 priority=r.get("priority", 0),
                 is_enabled=r.get("is_enabled", True),
                 match_pattern=r.get("match_pattern"),
@@ -165,6 +216,7 @@ class SourceRuleService:
                 code=row["code"],
                 name=row["name"],
                 description=row["description"],
+                category=row["category"] if "category" in row.keys() else "general",
                 priority=row["priority"],
                 is_enabled=bool(row["is_enabled"]),
                 match_pattern=row["match_pattern"],
@@ -189,39 +241,66 @@ class SourceRuleService:
         runtime_rules = SourceRuleService.get_runtime_rules(conn)
 
         merged: Dict[str, SourceRule] = {}
+        merge_log = []
 
         for rule in default_rules:
             merged[rule.code] = rule
 
         for rule in env_rules:
             if rule.code in merged:
-                if rule.priority >= merged[rule.code].priority:
-                    logger.info(
-                        f"[来源规则] 环境变量规则覆盖默认规则: {rule.code} "
-                        f"(优先级: {merged[rule.code].priority} -> {rule.priority})"
-                    )
+                existing = merged[rule.code]
+                if rule.priority >= existing.priority:
+                    merge_log.append({
+                        "code": rule.code,
+                        "action": "env_override",
+                        "from_layer": existing.source_layer,
+                        "to_layer": "environment",
+                        "from_priority": existing.priority,
+                        "to_priority": rule.priority,
+                    })
                     merged[rule.code] = rule
                 else:
-                    logger.info(
-                        f"[来源规则] 环境变量规则优先级低于默认规则，保留默认: {rule.code}"
-                    )
+                    merge_log.append({
+                        "code": rule.code,
+                        "action": "env_kept_default",
+                        "reason": "env_priority_lower",
+                        "env_priority": rule.priority,
+                        "default_priority": existing.priority,
+                    })
             else:
+                merge_log.append({
+                    "code": rule.code,
+                    "action": "env_added",
+                })
                 merged[rule.code] = rule
 
         for rule in runtime_rules:
             if rule.code in merged:
-                if rule.priority >= merged[rule.code].priority:
-                    logger.info(
-                        f"[来源规则] 运行时规则覆盖已有规则: {rule.code} "
-                        f"(优先级: {merged[rule.code].priority} -> {rule.priority}, "
-                        f"来源: {merged[rule.code].source_layer} -> runtime)"
-                    )
+                existing = merged[rule.code]
+                if rule.priority >= existing.priority:
+                    merge_log.append({
+                        "code": rule.code,
+                        "action": "runtime_override",
+                        "from_layer": existing.source_layer,
+                        "to_layer": "runtime",
+                        "from_priority": existing.priority,
+                        "to_priority": rule.priority,
+                    })
                     merged[rule.code] = rule
                 else:
-                    logger.info(
-                        f"[来源规则] 运行时规则优先级低于已有规则，保留原有: {rule.code}"
-                    )
+                    merge_log.append({
+                        "code": rule.code,
+                        "action": "runtime_kept_existing",
+                        "reason": "runtime_priority_lower",
+                        "runtime_priority": rule.priority,
+                        "existing_priority": existing.priority,
+                        "existing_layer": existing.source_layer,
+                    })
             else:
+                merge_log.append({
+                    "code": rule.code,
+                    "action": "runtime_added",
+                })
                 merged[rule.code] = rule
 
         result = sorted(
@@ -229,15 +308,50 @@ class SourceRuleService:
             key=lambda r: (-r.priority, r.code),
         )
 
-        logger.info(
-            f"[来源规则] 合并完成，共 {len(result)} 条有效规则 "
-            f"(默认: {len(default_rules)}, 环境: {len(env_rules)}, 运行时: {len(runtime_rules)})"
-        )
+        logger.info(json.dumps({
+            "event": "source_rules_merged",
+            "total_enabled": len(result),
+            "default_count": len(default_rules),
+            "environment_count": len(env_rules),
+            "runtime_count": len(runtime_rules),
+            "merge_details": merge_log,
+        }, ensure_ascii=False))
 
         SourceRuleService._cache["merged_rules"] = result
+        SourceRuleService._cache["merge_log"] = merge_log
         SourceRuleService._cache_timestamp = now
 
         return result
+
+    @staticmethod
+    def get_rule_by_code(code: str, conn=None) -> Optional[SourceRule]:
+        if conn is None:
+            conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM source_rules WHERE code = ?", (code,)
+        ).fetchone()
+        if row:
+            return SourceRule(
+                id=row["id"],
+                code=row["code"],
+                name=row["name"],
+                description=row["description"],
+                category=row["category"] if "category" in row.keys() else "general",
+                priority=row["priority"],
+                is_enabled=bool(row["is_enabled"]),
+                match_pattern=row["match_pattern"],
+                version=row["version"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                source_layer="runtime",
+            )
+        for r in SourceRuleService.get_default_rules():
+            if r.code == code:
+                return r
+        for r in SourceRuleService.get_environment_rules():
+            if r.code == code:
+                return r
+        return None
 
     @staticmethod
     def get_allowed_sources(conn=None) -> List[str]:
@@ -250,28 +364,102 @@ class SourceRuleService:
 
         for rule in rules:
             if rule.code == source_code:
-                logger.info(
-                    f"[来源规则] 命中规则: code={rule.code}, name={rule.name}, "
-                    f"priority={rule.priority}, layer={rule.source_layer}"
-                )
+                logger.info(json.dumps({
+                    "event": "source_rule_exact_match",
+                    "input_source": source_code,
+                    "matched_code": rule.code,
+                    "matched_name": rule.name,
+                    "matched_priority": rule.priority,
+                    "matched_category": rule.category,
+                    "matched_layer": rule.source_layer,
+                    "match_type": "exact",
+                }, ensure_ascii=False))
                 return rule
 
             if rule.match_pattern:
                 try:
                     if re.match(rule.match_pattern, source_code):
-                        logger.info(
-                            f"[来源规则] 模式匹配命中: code={rule.code}, "
-                            f"pattern={rule.match_pattern}, input={source_code}, "
-                            f"layer={rule.source_layer}"
-                        )
+                        logger.info(json.dumps({
+                            "event": "source_rule_pattern_match",
+                            "input_source": source_code,
+                            "matched_code": rule.code,
+                            "matched_name": rule.name,
+                            "matched_priority": rule.priority,
+                            "matched_category": rule.category,
+                            "matched_layer": rule.source_layer,
+                            "match_pattern": rule.match_pattern,
+                            "match_type": "pattern",
+                        }, ensure_ascii=False))
                         return rule
                 except re.error as e:
-                    logger.warning(
-                        f"[来源规则] 规则 {rule.code} 的匹配模式无效: {e}"
-                    )
+                    logger.warning(json.dumps({
+                        "event": "source_rule_pattern_error",
+                        "rule_code": rule.code,
+                        "pattern": rule.match_pattern,
+                        "error": str(e),
+                    }, ensure_ascii=False))
 
-        logger.warning(f"[来源规则] 未找到匹配的来源规则: {source_code}")
+        logger.warning(json.dumps({
+            "event": "source_rule_no_match",
+            "input_source": source_code,
+            "allowed_sources": [r.code for r in rules],
+        }, ensure_ascii=False))
         return None
+
+    @staticmethod
+    def detect_source(source_code: Optional[str], remark: str = None, conn=None) -> Tuple[str, Optional[SourceRule]]:
+        if source_code:
+            rule = SourceRuleService.match_source(source_code, conn)
+            if rule:
+                return source_code, rule
+            rules = SourceRuleService.get_merged_rules(conn)
+            for r in rules:
+                if r.match_pattern:
+                    try:
+                        if re.match(r.match_pattern, source_code):
+                            logger.info(json.dumps({
+                                "event": "source_auto_detected_from_code_pattern",
+                                "source_code": source_code,
+                                "detected_code": r.code,
+                                "matched_pattern": r.match_pattern,
+                            }, ensure_ascii=False))
+                            return source_code, r
+                    except re.error:
+                        pass
+            return source_code, None
+
+        if remark:
+            rules = SourceRuleService.get_merged_rules(conn)
+            for rule in rules:
+                if rule.match_pattern:
+                    try:
+                        if re.match(rule.match_pattern, remark):
+                            logger.info(json.dumps({
+                                "event": "source_auto_detected_from_remark",
+                                "remark": remark,
+                                "detected_code": rule.code,
+                                "matched_pattern": rule.match_pattern,
+                            }, ensure_ascii=False))
+                            return rule.code, rule
+                    except re.error:
+                        pass
+
+        makeup_cfg_default = "window"
+        try:
+            from services.config_service import ConfigService
+            makeup_cfg_default = ConfigService.get_config("makeup_default_source", conn) or "window"
+        except Exception:
+            pass
+
+        default_rule = SourceRuleService.match_source(makeup_cfg_default, conn)
+        logger.info(json.dumps({
+            "event": "source_fallback_to_default",
+            "default_source": makeup_cfg_default,
+            "input_source": source_code,
+            "remark": remark,
+            "matched_rule": default_rule.code if default_rule else None,
+        }, ensure_ascii=False))
+        return makeup_cfg_default, default_rule
 
     @staticmethod
     def validate_source(source_code: str, conn=None) -> Tuple[bool, Optional[str], Optional[SourceRule]]:
@@ -290,7 +478,7 @@ class SourceRuleService:
         )
 
     @staticmethod
-    def validate_rule_data(rule_data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    def validate_rule_data(rule_data: Dict[str, Any], check_merged: bool = False, conn=None) -> Tuple[bool, List[str]]:
         errors = []
 
         if not isinstance(rule_data, dict):
@@ -318,6 +506,13 @@ class SourceRuleService:
                     f"{', '.join(SourceRuleService.SUPPORTED_VERSIONS)}"
                 )
 
+        if "category" in rule_data:
+            if rule_data["category"] not in VALID_CATEGORIES:
+                errors.append(
+                    f"category '{rule_data['category']}' 不合法，允许的值: "
+                    f"{', '.join(sorted(VALID_CATEGORIES))}"
+                )
+
         if "priority" in rule_data:
             if not isinstance(rule_data["priority"], int):
                 errors.append("priority 必须是整数")
@@ -334,7 +529,79 @@ class SourceRuleService:
             except re.error as e:
                 errors.append(f"match_pattern 不是有效的正则表达式: {e}")
 
+        if check_merged and "code" in rule_data and isinstance(rule_data["code"], str):
+            merged_rules = SourceRuleService.get_merged_rules(conn)
+            matched = next((r for r in merged_rules if r.code == rule_data["code"]), None)
+            if matched:
+                existing_info = {
+                    "code": matched.code,
+                    "name": matched.name,
+                    "priority": matched.priority,
+                    "category": matched.category,
+                    "is_enabled": matched.is_enabled,
+                    "source_layer": matched.source_layer,
+                }
+                errors.append(
+                    f"来源 code='{rule_data['code']}' 在合并规则中已存在"
+                    f" (层级: {matched.source_layer}, 名称: {matched.name}, "
+                    f"优先级: {matched.priority}, 类别: {matched.category}); "
+                    f"现有规则: {json.dumps(existing_info, ensure_ascii=False)}"
+                )
+
         return len(errors) == 0, errors
+
+    @staticmethod
+    def _write_audit_log(rule_code: str, operation: str, before_data: Dict = None,
+                         after_data: Dict = None, operator: str = None,
+                         remark: str = None, conn=None):
+        if conn is None:
+            conn = get_db()
+        now = now_str()
+        conn.execute(
+            """INSERT INTO source_rules_audit_log
+               (rule_code, operation, operator, before_json, after_json, remark, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                rule_code,
+                operation,
+                operator,
+                json.dumps(before_data, ensure_ascii=False) if before_data else None,
+                json.dumps(after_data, ensure_ascii=False) if after_data else None,
+                remark,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def get_audit_log(rule_code: str = None, limit: int = 50, conn=None) -> List[Dict[str, Any]]:
+        if conn is None:
+            conn = get_db()
+        if rule_code:
+            rows = conn.execute(
+                "SELECT * FROM source_rules_audit_log WHERE rule_code = ? ORDER BY id DESC LIMIT ?",
+                (rule_code, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM source_rules_audit_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        result = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["before"] = json.loads(entry["before_json"]) if entry["before_json"] else None
+            except json.JSONDecodeError:
+                entry["before"] = None
+            try:
+                entry["after"] = json.loads(entry["after_json"]) if entry["after_json"] else None
+            except json.JSONDecodeError:
+                entry["after"] = None
+            entry.pop("before_json", None)
+            entry.pop("after_json", None)
+            result.append(entry)
+        return result
 
     @staticmethod
     def list_rules(conn=None) -> Dict[str, Any]:
@@ -343,10 +610,18 @@ class SourceRuleService:
         default_rules = SourceRuleService.get_default_rules()
         env_rules = SourceRuleService.get_environment_rules()
 
+        categories = {}
+        for r in merged_rules:
+            cat = r.category
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(r.code)
+
         return {
             "version": SourceRuleService.RULES_VERSION,
             "total": len(merged_rules),
             "rules": [r.to_dict() for r in merged_rules],
+            "categories": categories,
             "layers": {
                 "default": [r.to_dict() for r in default_rules],
                 "environment": [r.to_dict() for r in env_rules],
@@ -367,6 +642,7 @@ class SourceRuleService:
         code: str,
         name: str,
         description: str = None,
+        category: str = "general",
         priority: int = 0,
         is_enabled: bool = True,
         match_pattern: str = None,
@@ -376,13 +652,14 @@ class SourceRuleService:
             "code": code,
             "name": name,
             "description": description,
+            "category": category,
             "priority": priority,
             "is_enabled": is_enabled,
             "match_pattern": match_pattern,
             "version": SourceRuleService.RULES_VERSION,
         }
 
-        is_valid, errors = SourceRuleService.validate_rule_data(rule_data)
+        is_valid, errors = SourceRuleService.validate_rule_data(rule_data, check_merged=True, conn=conn)
         if not is_valid:
             raise ValueError(f"规则数据验证失败: {'; '.join(errors)}")
 
@@ -396,12 +673,13 @@ class SourceRuleService:
             now = now_str()
             conn_inner.execute(
                 """INSERT INTO source_rules 
-                   (code, name, description, priority, is_enabled, match_pattern, version, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (code, name, description, category, priority, is_enabled, match_pattern, version, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     code,
                     name,
                     description,
+                    category,
                     priority,
                     1 if is_enabled else 0,
                     match_pattern,
@@ -415,17 +693,12 @@ class SourceRuleService:
                 "SELECT * FROM source_rules WHERE code = ?", (code,)
             ).fetchone()
 
-            logger.info(
-                f"[来源规则] 创建成功: code={code}, name={name}, priority={priority}"
-            )
-
-            SourceRuleService._invalidate_cache()
-
-            return SourceRule(
+            created_rule = SourceRule(
                 id=row["id"],
                 code=row["code"],
                 name=row["name"],
                 description=row["description"],
+                category=row["category"] if "category" in row.keys() else "general",
                 priority=row["priority"],
                 is_enabled=bool(row["is_enabled"]),
                 match_pattern=row["match_pattern"],
@@ -434,6 +707,25 @@ class SourceRuleService:
                 updated_at=row["updated_at"],
                 source_layer="runtime",
             )
+
+            SourceRuleService._write_audit_log(
+                rule_code=code,
+                operation="create",
+                after_data=created_rule.to_dict(),
+                conn=conn_inner,
+            )
+
+            logger.info(json.dumps({
+                "event": "source_rule_created",
+                "code": code,
+                "name": name,
+                "category": category,
+                "priority": priority,
+            }, ensure_ascii=False))
+
+            SourceRuleService._invalidate_cache()
+
+            return created_rule
 
         if conn is None:
             with transaction() as conn:
@@ -446,6 +738,7 @@ class SourceRuleService:
         code: str,
         name: str = None,
         description: str = None,
+        category: str = None,
         priority: int = None,
         is_enabled: bool = None,
         match_pattern: str = None,
@@ -458,11 +751,18 @@ class SourceRuleService:
             if not existing:
                 raise ValueError(f"来源规则 code={code} 不存在")
 
+            before_data = dict(existing)
+            before_data["is_enabled"] = bool(before_data["is_enabled"])
+            if "category" not in before_data:
+                before_data["category"] = "general"
+
             update_data = {}
             if name is not None:
                 update_data["name"] = name
             if description is not None:
                 update_data["description"] = description
+            if category is not None:
+                update_data["category"] = category
             if priority is not None:
                 update_data["priority"] = priority
             if is_enabled is not None:
@@ -473,8 +773,9 @@ class SourceRuleService:
             if not update_data:
                 raise ValueError("没有需要更新的字段")
 
-            validate_data = {**dict(existing), **update_data}
-            validate_data["is_enabled"] = bool(validate_data.get("is_enabled", existing["is_enabled"]))
+            validate_data = {**before_data, **update_data}
+            if "is_enabled" in update_data:
+                validate_data["is_enabled"] = bool(update_data["is_enabled"])
             is_valid, errors = SourceRuleService.validate_rule_data(validate_data)
             if not is_valid:
                 raise ValueError(f"规则数据验证失败: {'; '.join(errors)}")
@@ -494,17 +795,12 @@ class SourceRuleService:
                 "SELECT * FROM source_rules WHERE code = ?", (code,)
             ).fetchone()
 
-            logger.info(
-                f"[来源规则] 更新成功: code={code}, updates={list(update_data.keys())}"
-            )
-
-            SourceRuleService._invalidate_cache()
-
-            return SourceRule(
+            updated_rule = SourceRule(
                 id=row["id"],
                 code=row["code"],
                 name=row["name"],
                 description=row["description"],
+                category=row["category"] if "category" in row.keys() else "general",
                 priority=row["priority"],
                 is_enabled=bool(row["is_enabled"]),
                 match_pattern=row["match_pattern"],
@@ -513,6 +809,28 @@ class SourceRuleService:
                 updated_at=row["updated_at"],
                 source_layer="runtime",
             )
+
+            after_data = updated_rule.to_dict()
+
+            SourceRuleService._write_audit_log(
+                rule_code=code,
+                operation="update",
+                before_data=before_data,
+                after_data=after_data,
+                conn=conn_inner,
+            )
+
+            logger.info(json.dumps({
+                "event": "source_rule_updated",
+                "code": code,
+                "updated_fields": list(update_data.keys()),
+                "before": before_data,
+                "after": after_data,
+            }, ensure_ascii=False))
+
+            SourceRuleService._invalidate_cache()
+
+            return updated_rule
 
         if conn is None:
             with transaction() as conn:
@@ -529,9 +847,26 @@ class SourceRuleService:
             if not existing:
                 raise ValueError(f"来源规则 code={code} 不存在")
 
+            before_data = dict(existing)
+            before_data["is_enabled"] = bool(before_data["is_enabled"])
+            if "category" not in before_data:
+                before_data["category"] = "general"
+
             conn_inner.execute("DELETE FROM source_rules WHERE code = ?", (code,))
 
-            logger.info(f"[来源规则] 删除成功: code={code}")
+            SourceRuleService._write_audit_log(
+                rule_code=code,
+                operation="delete",
+                before_data=before_data,
+                conn=conn_inner,
+            )
+
+            logger.info(json.dumps({
+                "event": "source_rule_deleted",
+                "code": code,
+                "deleted_rule": before_data,
+            }, ensure_ascii=False))
+
             SourceRuleService._invalidate_cache()
             return True
 
@@ -545,6 +880,7 @@ class SourceRuleService:
     def import_rules(
         rules_data: List[Dict[str, Any]],
         conflict_strategy: str = "skip",
+        dry_run: bool = False,
         conn=None,
     ) -> Dict[str, Any]:
         if conflict_strategy not in SourceRuleService.CONFLICT_STRATEGIES:
@@ -563,6 +899,7 @@ class SourceRuleService:
             "conflicts": [],
             "errors": [],
             "imported_rules": [],
+            "dry_run": dry_run,
         }
 
         if not isinstance(rules_data, list):
@@ -573,11 +910,14 @@ class SourceRuleService:
 
         def _execute(conn_inner):
             now = now_str()
-            existing_codes = {
+            existing_db_codes = {
                 row["code"] for row in conn_inner.execute(
                     "SELECT code FROM source_rules"
                 ).fetchall()
             }
+
+            merged_rules = SourceRuleService.get_merged_rules(conn_inner)
+            merged_codes = {r.code: r for r in merged_rules}
 
             for idx, rule_data in enumerate(rules_data):
                 rule_identifier = rule_data.get("code", f"index={idx}")
@@ -600,27 +940,95 @@ class SourceRuleService:
                     continue
 
                 code = rule_data["code"]
-                if code in existing_codes:
+
+                conflict_with_merged = None
+                if code in merged_codes:
+                    existing_rule = merged_codes[code]
+                    conflict_with_merged = {
+                        "code": existing_rule.code,
+                        "name": existing_rule.name,
+                        "priority": existing_rule.priority,
+                        "category": existing_rule.category,
+                        "is_enabled": existing_rule.is_enabled,
+                        "source_layer": existing_rule.source_layer,
+                        "match_pattern": existing_rule.match_pattern,
+                    }
+
+                conflict_with_db = code in existing_db_codes
+
+                if conflict_with_merged or conflict_with_db:
                     conflict_info = {
                         "code": code,
                         "index": idx,
                         "strategy": conflict_strategy,
+                        "incoming_rule": {
+                            "code": code,
+                            "name": rule_data.get("name"),
+                            "priority": rule_data.get("priority", 0),
+                            "category": rule_data.get("category", "general"),
+                            "is_enabled": rule_data.get("is_enabled", True),
+                            "match_pattern": rule_data.get("match_pattern"),
+                        },
+                        "existing_rule": conflict_with_merged or {"code": code, "source_layer": "runtime"},
                     }
 
                     if conflict_strategy == "skip":
                         results["skipped_count"] += 1
                         conflict_info["action"] = "skipped"
-                        conflict_info["reason"] = "已存在，跳过"
+                        conflict_info["reason"] = (
+                            f"来源 code='{code}' 已存在"
+                            f" (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'}"
+                            f", 名称: {conflict_with_merged['name'] if conflict_with_merged else code})"
+                            f"，跳过导入"
+                        )
                         results["conflicts"].append(conflict_info)
-                        logger.info(f"[来源规则导入] 跳过已存在规则: {code}")
+                        logger.info(json.dumps({
+                            "event": "source_rule_import_skip",
+                            "code": code,
+                            "existing_layer": conflict_with_merged["source_layer"] if conflict_with_merged else "runtime",
+                        }, ensure_ascii=False))
                         continue
 
                     elif conflict_strategy == "overwrite":
+                        if not conflict_with_db:
+                            results["skipped_count"] += 1
+                            conflict_info["action"] = "skipped_not_runtime"
+                            conflict_info["reason"] = (
+                                f"来源 code='{code}' 存在于 {conflict_with_merged['source_layer']} 层"
+                                f" 但不在 runtime 层，无法覆盖，跳过"
+                            )
+                            results["conflicts"].append(conflict_info)
+                            results["errors"].append(
+                                f"规则 {code} 存在于 {conflict_with_merged['source_layer']} 层"
+                                f" 但不在 runtime 数据库中，无法覆盖"
+                            )
+                            logger.warning(json.dumps({
+                                "event": "source_rule_import_skip_not_runtime",
+                                "code": code,
+                                "existing_layer": conflict_with_merged["source_layer"],
+                            }, ensure_ascii=False))
+                            continue
+
+                        if dry_run:
+                            conflict_info["action"] = "would_overwrite"
+                            conflict_info["reason"] = "dry_run模式，仅预览不会实际覆盖"
+                            results["conflicts"].append(conflict_info)
+                            results["success_count"] += 1
+                            continue
+
                         try:
+                            before_row = conn_inner.execute(
+                                "SELECT * FROM source_rules WHERE code = ?", (code,)
+                            ).fetchone()
+                            before_data = dict(before_row) if before_row else None
+                            if before_data:
+                                before_data["is_enabled"] = bool(before_data["is_enabled"])
+
                             updated = SourceRuleService.update_rule(
                                 code=code,
                                 name=rule_data.get("name"),
                                 description=rule_data.get("description"),
+                                category=rule_data.get("category"),
                                 priority=rule_data.get("priority", 0),
                                 is_enabled=rule_data.get("is_enabled", True),
                                 match_pattern=rule_data.get("match_pattern"),
@@ -628,11 +1036,24 @@ class SourceRuleService:
                             )
                             results["success_count"] += 1
                             conflict_info["action"] = "overwritten"
-                            conflict_info["reason"] = "已存在，覆盖更新"
+                            conflict_info["reason"] = (
+                                f"已存在(层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'})，"
+                                f"覆盖更新; 变更: "
+                                f"name={before_data.get('name') if before_data else None}->{rule_data.get('name')}, "
+                                f"priority={before_data.get('priority') if before_data else None}->{rule_data.get('priority', 0)}, "
+                                f"category={before_data.get('category') if before_data else None}->{rule_data.get('category', 'general')}"
+                            )
+                            conflict_info["before"] = before_data
+                            conflict_info["after"] = updated.to_dict()
                             results["conflicts"].append(conflict_info)
                             results["imported_rules"].append(updated.to_dict())
-                            existing_codes.add(code)
-                            logger.info(f"[来源规则导入] 覆盖已存在规则: {code}")
+                            existing_db_codes.add(code)
+                            logger.info(json.dumps({
+                                "event": "source_rule_import_overwrite",
+                                "code": code,
+                                "before": before_data,
+                                "after": updated.to_dict(),
+                            }, ensure_ascii=False))
                             continue
                         except ValueError as e:
                             results["error_count"] += 1
@@ -644,18 +1065,38 @@ class SourceRuleService:
                     elif conflict_strategy == "report":
                         results["error_count"] += 1
                         conflict_info["action"] = "reported"
-                        conflict_info["reason"] = "已存在，报告冲突"
+                        conflict_info["reason"] = (
+                            f"来源 code='{code}' 已存在"
+                            f" (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'}"
+                            f", 名称: {conflict_with_merged['name'] if conflict_with_merged else code})"
+                            f"，冲突策略为 report，导入失败"
+                        )
                         results["conflicts"].append(conflict_info)
                         results["errors"].append(
-                            f"规则 {code} 已存在，冲突策略为 report，导入失败"
+                            f"规则 {code} 已存在 (层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'})，"
+                            f"冲突策略为 report，导入失败"
                         )
                         continue
+
+                if dry_run:
+                    results["success_count"] += 1
+                    results["imported_rules"].append({
+                        "code": code,
+                        "name": rule_data.get("name"),
+                        "category": rule_data.get("category", "general"),
+                        "priority": rule_data.get("priority", 0),
+                        "is_enabled": rule_data.get("is_enabled", True),
+                        "match_pattern": rule_data.get("match_pattern"),
+                        "dry_run": True,
+                    })
+                    continue
 
                 try:
                     created = SourceRuleService.create_rule(
                         code=code,
                         name=rule_data["name"],
                         description=rule_data.get("description"),
+                        category=rule_data.get("category", "general"),
                         priority=rule_data.get("priority", 0),
                         is_enabled=rule_data.get("is_enabled", True),
                         match_pattern=rule_data.get("match_pattern"),
@@ -663,8 +1104,11 @@ class SourceRuleService:
                     )
                     results["success_count"] += 1
                     results["imported_rules"].append(created.to_dict())
-                    existing_codes.add(code)
-                    logger.info(f"[来源规则导入] 新增规则成功: {code}")
+                    existing_db_codes.add(code)
+                    logger.info(json.dumps({
+                        "event": "source_rule_import_created",
+                        "code": code,
+                    }, ensure_ascii=False))
                 except ValueError as e:
                     results["error_count"] += 1
                     results["errors"].append(
@@ -673,39 +1117,49 @@ class SourceRuleService:
 
             results["success"] = results["error_count"] == 0
 
-            details_json = json.dumps({
-                "conflicts": results["conflicts"],
-                "errors": results["errors"],
-            }, ensure_ascii=False)
+            if not dry_run:
+                details_json = json.dumps({
+                    "conflicts": results["conflicts"],
+                    "errors": results["errors"],
+                }, ensure_ascii=False)
 
-            result_summary = (
-                f"导入完成: 成功{results['success_count']}条, "
-                f"跳过{results['skipped_count']}条, "
-                f"失败{results['error_count']}条"
-            )
+                result_summary = (
+                    f"导入完成: 成功{results['success_count']}条, "
+                    f"跳过{results['skipped_count']}条, "
+                    f"失败{results['error_count']}条"
+                    f"{' (dry_run)' if dry_run else ''}"
+                )
 
-            conn_inner.execute(
-                """INSERT INTO source_rules_import_log
-                   (import_version, rules_count, success_count, skipped_count, 
-                    error_count, conflict_strategy, result_summary, details_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    SourceRuleService.RULES_VERSION,
-                    results["rules_count"],
-                    results["success_count"],
-                    results["skipped_count"],
-                    results["error_count"],
-                    conflict_strategy,
-                    result_summary,
-                    details_json,
-                    now,
-                ),
-            )
+                conn_inner.execute(
+                    """INSERT INTO source_rules_import_log
+                       (import_version, rules_count, success_count, skipped_count, 
+                        error_count, conflict_strategy, result_summary, details_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        SourceRuleService.RULES_VERSION,
+                        results["rules_count"],
+                        results["success_count"],
+                        results["skipped_count"],
+                        results["error_count"],
+                        conflict_strategy,
+                        result_summary,
+                        details_json,
+                        now,
+                    ),
+                )
 
-            logger.info(f"[来源规则导入] {result_summary}")
+                logger.info(json.dumps({
+                    "event": "source_rules_import_completed",
+                    "summary": result_summary,
+                    "success_count": results["success_count"],
+                    "skipped_count": results["skipped_count"],
+                    "error_count": results["error_count"],
+                    "conflict_strategy": conflict_strategy,
+                    "dry_run": dry_run,
+                }, ensure_ascii=False))
 
-            if results["success_count"] > 0:
-                SourceRuleService._invalidate_cache()
+                if results["success_count"] > 0 or results["skipped_count"] > 0:
+                    SourceRuleService._invalidate_cache()
 
             return results
 
@@ -716,7 +1170,51 @@ class SourceRuleService:
             return _execute(conn)
 
     @staticmethod
-    def export_rules(only_enabled: bool = True, conn=None) -> Dict[str, Any]:
+    def export_rules(only_enabled: bool = True, include_all_layers: bool = False, conn=None) -> Dict[str, Any]:
+        if include_all_layers:
+            runtime_rules = SourceRuleService.get_runtime_rules(conn)
+            default_rules = SourceRuleService.get_default_rules()
+            env_rules = SourceRuleService.get_environment_rules()
+
+            if only_enabled:
+                runtime_rules = [r for r in runtime_rules if r.is_enabled]
+                default_rules = [r for r in default_rules if r.is_enabled]
+                env_rules = [r for r in env_rules if r.is_enabled]
+
+            def _rule_export(r: SourceRule) -> Dict[str, Any]:
+                return {
+                    "code": r.code,
+                    "name": r.name,
+                    "description": r.description,
+                    "category": r.category,
+                    "priority": r.priority,
+                    "is_enabled": r.is_enabled,
+                    "match_pattern": r.match_pattern,
+                    "version": r.version,
+                    "source_layer": r.source_layer,
+                }
+
+            export_data = {
+                "version": SourceRuleService.RULES_VERSION,
+                "exported_at": now_str(),
+                "include_all_layers": True,
+                "layers": {
+                    "default": [_rule_export(r) for r in default_rules],
+                    "environment": [_rule_export(r) for r in env_rules],
+                    "runtime": [_rule_export(r) for r in runtime_rules],
+                },
+                "count": len(runtime_rules) + len(default_rules) + len(env_rules),
+                "rules": [_rule_export(r) for r in runtime_rules],
+            }
+
+            logger.info(json.dumps({
+                "event": "source_rules_exported_all_layers",
+                "default_count": len(default_rules),
+                "environment_count": len(env_rules),
+                "runtime_count": len(runtime_rules),
+            }, ensure_ascii=False))
+            return export_data
+
         rules = SourceRuleService.get_runtime_rules(conn)
 
         if only_enabled:
@@ -725,12 +1223,14 @@ class SourceRuleService:
         export_data = {
             "version": SourceRuleService.RULES_VERSION,
             "exported_at": now_str(),
+            "include_all_layers": False,
             "count": len(rules),
             "rules": [
                 {
                     "code": r.code,
                     "name": r.name,
                     "description": r.description,
+                    "category": r.category,
                     "priority": r.priority,
                     "is_enabled": r.is_enabled,
                     "match_pattern": r.match_pattern,
@@ -740,7 +1240,11 @@ class SourceRuleService:
             ],
         }
 
-        logger.info(f"[来源规则导出] 共导出 {len(rules)} 条规则")
+        logger.info(json.dumps({
+            "event": "source_rules_exported",
+            "count": len(rules),
+            "only_enabled": only_enabled,
+        }, ensure_ascii=False))
         return export_data
 
     @staticmethod

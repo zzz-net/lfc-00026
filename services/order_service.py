@@ -253,33 +253,69 @@ class OrderService:
         default_source = makeup_cfg["default_source"]
         default_remark = makeup_cfg["default_remark"]
 
-        source = source or default_source
-        remark = remark or default_remark
+        detected_source, matched_rule = SourceRuleService.detect_source(source, remark, conn=get_db())
 
-        is_valid, error_msg, matched_rule = SourceRuleService.validate_source(source)
-        if not is_valid:
-            logger.warning(
-                f"[补录] 来源验证失败: source={source}, error={error_msg}"
-            )
-            raise ValueError(error_msg)
+        if source and source != detected_source:
+            is_valid, error_msg, rule_from_validate = SourceRuleService.validate_source(source)
+            if not is_valid:
+                logger.warning(json.dumps({
+                    "event": "makeup_source_validation_failed",
+                    "source": source,
+                    "error": error_msg,
+                }, ensure_ascii=False))
+                raise ValueError(error_msg)
+            matched_rule = rule_from_validate
+            detected_source = source
+
+        if matched_rule and not matched_rule.is_enabled:
+            logger.warning(json.dumps({
+                "event": "makeup_source_rule_disabled",
+                "source": detected_source,
+                "rule_code": matched_rule.code,
+                "rule_name": matched_rule.name,
+            }, ensure_ascii=False))
+            raise ValueError(f"来源规则 {matched_rule.code} 已禁用，无法用于补录")
+
+        if not matched_rule and source:
+            disabled_rule = SourceRuleService.get_rule_by_code(source, conn=get_db())
+            if disabled_rule and not disabled_rule.is_enabled:
+                logger.warning(json.dumps({
+                    "event": "makeup_source_rule_disabled",
+                    "source": source,
+                    "rule_code": disabled_rule.code,
+                    "rule_name": disabled_rule.name,
+                }, ensure_ascii=False))
+                raise ValueError(f"来源规则 {disabled_rule.code} 已禁用，无法用于补录")
+
+        source = detected_source
+        remark = remark or default_remark
 
         matched_rule_info = None
         if matched_rule:
             matched_rule_info = matched_rule.to_dict()
             logger.info(
                 json.dumps({
-                    "event": "source_rule_matched",
-                    "order": {
+                    "event": "makeup_source_rule_matched",
+                    "source": source,
+                    "matched_rule": {
+                        "code": matched_rule.code,
+                        "name": matched_rule.name,
+                        "category": matched_rule.category,
+                        "priority": matched_rule.priority,
+                        "source_layer": matched_rule.source_layer,
+                        "match_pattern": matched_rule.match_pattern,
+                    },
+                    "order_context": {
                         "employee_id": employee_id,
                         "menu_item_id": menu_item_id,
                         "quantity": quantity,
                         "serving_date": serving_date,
                     },
-                    "matched_rule": matched_rule_info,
-                    "rule_code": matched_rule.code,
-                    "rule_name": matched_rule.name,
-                    "rule_priority": matched_rule.priority,
-                    "rule_layer": matched_rule.source_layer,
+                    "determination": {
+                        "source_provided": bool(source),
+                        "auto_detected": source is None or source == "",
+                        "fallback_to_default": matched_rule.code == makeup_cfg["default_source"],
+                    },
                 }, ensure_ascii=False)
             )
 
@@ -455,9 +491,13 @@ class OrderService:
                     "total_amount": total_amount,
                     "source": source,
                     "matched_rule": matched_rule_info,
-                    "rule_code": matched_rule.code if matched_rule else None,
-                    "rule_name": matched_rule.name if matched_rule else None,
-                    "rule_layer": matched_rule.source_layer if matched_rule else None,
+                    "determination": {
+                        "rule_code": matched_rule.code if matched_rule else None,
+                        "rule_name": matched_rule.name if matched_rule else None,
+                        "rule_category": matched_rule.category if matched_rule else None,
+                        "rule_layer": matched_rule.source_layer if matched_rule else None,
+                        "source_provided": bool(source),
+                    },
                 }, ensure_ascii=False)
             )
 
@@ -515,7 +555,16 @@ class OrderService:
 
         rows = conn.execute(query, params).fetchall()
 
-        merged_rules = {r.code: r.to_dict() for r in SourceRuleService.get_merged_rules(conn)}
+        all_rules = {r.code: r for r in SourceRuleService.get_merged_rules(conn)}
+        disabled_rules = {}
+        for r in SourceRuleService.get_runtime_rules(conn):
+            if r.code not in all_rules:
+                disabled_rules[r.code] = r
+        for r in SourceRuleService.get_default_rules():
+            if r.code not in all_rules and r.code not in disabled_rules:
+                disabled_rules[r.code] = r
+        all_rules.update(disabled_rules)
+        all_rules_dict = {code: r.to_dict() for code, r in all_rules.items()}
 
         items = []
         for row in rows:
@@ -523,8 +572,13 @@ class OrderService:
             order_id = order_dict["id"]
             order_source = order_dict.get("source")
 
-            if order_source and order_source in merged_rules:
-                order_dict["matched_source_rule"] = merged_rules[order_source]
+            if order_source:
+                if order_source in all_rules_dict:
+                    order_dict["matched_source_rule"] = all_rules_dict[order_source]
+                else:
+                    _, pattern_rule = SourceRuleService.detect_source(order_source, conn=conn)
+                    if pattern_rule:
+                        order_dict["matched_source_rule"] = pattern_rule.to_dict()
 
             txns = conn.execute(
                 """SELECT type, amount, balance_before, balance_after,
@@ -635,6 +689,8 @@ class OrderService:
             order_dict = dict(row)
 
             matched_rule = SourceRuleService.match_source(order_dict.get("source", ""), conn)
+            if not matched_rule and order_dict.get("source"):
+                _, matched_rule = SourceRuleService.detect_source(order_dict.get("source"), conn=conn)
             if matched_rule:
                 order_dict["matched_source_rule"] = matched_rule.to_dict()
 
@@ -647,9 +703,12 @@ class OrderService:
                     "source": order["source"],
                     "remark": remark,
                     "matched_rule": matched_rule.to_dict() if matched_rule else None,
-                    "rule_code": matched_rule.code if matched_rule else None,
-                    "rule_name": matched_rule.name if matched_rule else None,
-                    "rule_layer": matched_rule.source_layer if matched_rule else None,
+                    "determination": {
+                        "rule_code": matched_rule.code if matched_rule else None,
+                        "rule_name": matched_rule.name if matched_rule else None,
+                        "rule_category": matched_rule.category if matched_rule else None,
+                        "rule_layer": matched_rule.source_layer if matched_rule else None,
+                    },
                 }, ensure_ascii=False)
             )
 
