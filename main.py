@@ -584,9 +584,10 @@ def admin_get_import_history_detail(import_id: int):
 @app.get("/api/admin/source-rules/import-history", tags=["管理员"], summary="获取导入历史")
 def admin_get_import_history(
     limit: int = Query(20, ge=1, le=100, description="返回条数"),
+    operator: Optional[str] = Query(None, description="按操作人过滤"),
 ):
     try:
-        return SourceRuleService.get_import_history(limit=limit)
+        return SourceRuleService.get_import_history(limit=limit, operator=operator)
     except Exception as e:
         error_response(str(e), "SOURCE_RULE_ERROR", 400)
 
@@ -594,10 +595,11 @@ def admin_get_import_history(
 @app.get("/api/admin/source-rules/audit-log", tags=["管理员"], summary="获取来源规则审计日志")
 def admin_get_source_rules_audit_log(
     rule_code: Optional[str] = Query(None, description="按规则code过滤"),
+    import_id: Optional[int] = Query(None, description="按导入批次ID过滤"),
     limit: int = Query(50, ge=1, le=200, description="返回条数"),
 ):
     try:
-        return SourceRuleService.get_audit_log(rule_code=rule_code, limit=limit)
+        return SourceRuleService.get_audit_log(rule_code=rule_code, import_id=import_id, limit=limit)
     except Exception as e:
         error_response(str(e), "SOURCE_RULE_ERROR", 400)
 

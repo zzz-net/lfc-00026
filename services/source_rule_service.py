@@ -559,14 +559,14 @@ class SourceRuleService:
     @staticmethod
     def _write_audit_log(rule_code: str, operation: str, before_data: Dict = None,
                          after_data: Dict = None, operator: str = None,
-                         remark: str = None, conn=None):
+                         remark: str = None, import_id: int = None, conn=None):
         if conn is None:
             conn = get_db()
         now = now_str()
         conn.execute(
             """INSERT INTO source_rules_audit_log
-               (rule_code, operation, operator, before_json, after_json, remark, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (rule_code, operation, operator, before_json, after_json, remark, import_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rule_code,
                 operation,
@@ -574,24 +574,28 @@ class SourceRuleService:
                 json.dumps(before_data, ensure_ascii=False) if before_data else None,
                 json.dumps(after_data, ensure_ascii=False) if after_data else None,
                 remark,
+                import_id,
                 now,
             ),
         )
 
     @staticmethod
-    def get_audit_log(rule_code: str = None, limit: int = 50, conn=None) -> List[Dict[str, Any]]:
+    def get_audit_log(rule_code: str = None, import_id: int = None, limit: int = 50, conn=None) -> List[Dict[str, Any]]:
         if conn is None:
             conn = get_db()
+        conditions = []
+        params = []
         if rule_code:
-            rows = conn.execute(
-                "SELECT * FROM source_rules_audit_log WHERE rule_code = ? ORDER BY id DESC LIMIT ?",
-                (rule_code, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM source_rules_audit_log ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            conditions.append("rule_code = ?")
+            params.append(rule_code)
+        if import_id:
+            conditions.append("import_id = ?")
+            params.append(import_id)
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = conn.execute(
+            f"SELECT * FROM source_rules_audit_log{where_clause} ORDER BY id DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
 
         result = []
         for row in rows:
@@ -940,6 +944,40 @@ class SourceRuleService:
             all_runtime_rules = SourceRuleService.get_runtime_rules(conn_inner)
             all_runtime_dict = {r.code: r for r in all_runtime_rules}
 
+            if conflict_strategy == "report":
+                report_conflicts = []
+                for idx, rule_data in enumerate(rules_data):
+                    if not isinstance(rule_data, dict):
+                        continue
+                    code = rule_data.get("code", f"index={idx}")
+                    if code in merged_codes or code in existing_db_codes:
+                        existing = merged_codes.get(code)
+                        report_conflicts.append({
+                            "code": code,
+                            "index": idx,
+                            "existing_rule": {
+                                "code": existing.code if existing else code,
+                                "name": existing.name if existing else existing_db_codes.get(code, {}).get("name"),
+                                "priority": existing.priority if existing else existing_db_codes.get(code, {}).get("priority"),
+                                "category": existing.category if existing else existing_db_codes.get(code, {}).get("category"),
+                                "is_enabled": existing.is_enabled if existing else existing_db_codes.get(code, {}).get("is_enabled"),
+                                "source_layer": existing.source_layer if existing else "runtime",
+                            } if code in merged_codes else {
+                                "code": code,
+                                "source_layer": "runtime",
+                                **existing_db_codes.get(code, {}),
+                            },
+                            "action": "reported",
+                            "reason": f"来源 code='{code}' 已存在，冲突策略为 report，不执行导入",
+                        })
+                if report_conflicts:
+                    results["success"] = False
+                    results["error_count"] = len(report_conflicts)
+                    results["conflict_rules"] = report_conflicts
+                    results["errors"] = [c["reason"] for c in report_conflicts]
+                    results["result_summary"] = f"导入失败: 发现{len(report_conflicts)}个冲突 (report策略，不做任何修改)"
+                    return results
+
             for idx, rule_data in enumerate(rules_data):
                 rule_identifier = rule_data.get("code", f"index={idx}")
 
@@ -1261,9 +1299,26 @@ class SourceRuleService:
                     ),
                 )
 
+                import_id_row = conn_inner.execute(
+                    "SELECT last_insert_rowid() as id"
+                ).fetchone()
+                import_id = import_id_row["id"] if import_id_row else None
+                results["import_id"] = import_id
+
+                if import_id:
+                    effective_codes = [r.get("code") for r in results["new_rules"] + results["overwritten_rules"] if r.get("code")]
+                    if effective_codes:
+                        placeholders = ",".join("?" for _ in effective_codes)
+                        conn_inner.execute(
+                            f"UPDATE source_rules_audit_log SET import_id = ? "
+                            f"WHERE rule_code IN ({placeholders}) AND import_id IS NULL AND operation IN ('create', 'update')",
+                            [import_id] + effective_codes,
+                        )
+
                 logger.info(json.dumps({
                     "event": "source_rules_import_completed",
                     "summary": result_summary,
+                    "import_id": import_id,
                     "success_count": results["success_count"],
                     "new_count": results["new_count"],
                     "overwritten_count": results["overwritten_count"],
@@ -1411,7 +1466,7 @@ class SourceRuleService:
         return csv_content
 
     @staticmethod
-    def get_import_history(limit: int = 20, import_id: int = None, conn=None) -> List[Dict[str, Any]]:
+    def get_import_history(limit: int = 20, import_id: int = None, operator: str = None, conn=None) -> List[Dict[str, Any]]:
         if conn is None:
             conn = get_db()
 
@@ -1419,6 +1474,11 @@ class SourceRuleService:
             rows = conn.execute(
                 "SELECT * FROM source_rules_import_log WHERE id = ? ORDER BY id DESC",
                 (import_id,),
+            ).fetchall()
+        elif operator:
+            rows = conn.execute(
+                "SELECT * FROM source_rules_import_log WHERE operator = ? ORDER BY id DESC LIMIT ?",
+                (operator, limit),
             ).fetchall()
         else:
             rows = conn.execute(

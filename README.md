@@ -953,6 +953,412 @@ curl -X POST http://127.0.0.1:8000/api/admin/orders/makeup/ORD1781816702ABC12345
 python test_makeup_order.py
 ```
 
+## 来源规则批量维护
+
+补录来源规则决定了哪些来源可以发起补录、优先级如何、是否启用。本节描述**从准备数据、预检、正式导入、导入后回看、审计追查到重启持久化**的完整操作链路。
+
+### 接口总览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/admin/source-rules | 获取所有来源规则（含 default/environment/runtime 三层合并结果） |
+| GET | /api/admin/source-rules/{code} | 获取单个规则详情 |
+| POST | /api/admin/source-rules | 创建单条规则 |
+| PATCH | /api/admin/source-rules/{code} | 更新单条规则 |
+| DELETE | /api/admin/source-rules/{code} | 删除单条规则 |
+| POST | /api/admin/source-rules/import/dry-run | **预检**（dry-run，不写入数据库） |
+| POST | /api/admin/source-rules/import | **正式导入**（支持 skip/overwrite/report 三种冲突策略） |
+| GET | /api/admin/source-rules/import-history | 导入历史列表（可按 operator 过滤） |
+| GET | /api/admin/source-rules/import-history/{import_id} | 单次导入详情（含每条规则处理明细） |
+| GET | /api/admin/source-rules/audit-log | 审计日志（可按 rule_code、import_id 过滤） |
+| GET | /api/admin/source-rules/export/json | 导出规则 JSON |
+| GET | /api/admin/source-rules/export/csv | 导出规则 CSV |
+
+### 规则字段说明
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `code` | string | 是 | 规则唯一标识，最长 50 字符，如 `window`、`admin` |
+| `name` | string | 是 | 规则显示名称，最长 100 字符 |
+| `description` | string | 否 | 规则描述 |
+| `category` | string | 否 | 分类，可选值：`onsite`/`system`/`import`/`remote`/`general`，默认 `general` |
+| `priority` | int | 否 | 优先级 0-1000，数值越高优先级越高，默认 0 |
+| `is_enabled` | bool | 否 | 是否启用，默认 `true` |
+| `match_pattern` | string | 否 | 正则匹配模式，如 `^phone_.*` 可匹配 `phone_001` |
+| `version` | string | 否 | 规则版本，当前仅支持 `1.0` |
+
+### 操作链路（推荐按此顺序执行）
+
+#### 第一步：准备导入数据
+
+将要导入的规则组织为 JSON 数组：
+
+```json
+[
+  {
+    "code": "channel_a",
+    "name": "A渠道补录",
+    "description": "A渠道线下窗口补录",
+    "category": "onsite",
+    "priority": 60,
+    "is_enabled": true,
+    "match_pattern": null,
+    "version": "1.0"
+  },
+  {
+    "code": "channel_b",
+    "name": "B渠道补录",
+    "description": "B渠道电话补录",
+    "category": "remote",
+    "priority": 55,
+    "is_enabled": true,
+    "match_pattern": "^b_.*",
+    "version": "1.0"
+  }
+]
+```
+
+> **准备要点**：
+> - `code` 是唯一标识，与已有规则重复会触发冲突处理
+> - `category` 必须是允许值之一，否则整条校验失败
+> - `match_pattern` 为正则表达式，格式错误会校验失败
+> - 建议先用导出接口查看现有规则，避免冲突
+
+#### 第二步：Dry-run 预检
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/source-rules/import/dry-run \
+  -H "Content-Type: application/json" \
+  -H "X-Operator: admin_zhang" \
+  -d '{
+    "rules": [
+      {"code": "channel_a", "name": "A渠道补录", "category": "onsite", "priority": 60, "is_enabled": true, "version": "1.0"},
+      {"code": "admin", "name": "尝试覆盖已有admin", "priority": 200, "is_enabled": true, "version": "1.0"},
+      {"code": "bad_rule", "priority": 50}
+    ],
+    "conflict_strategy": "skip"
+  }'
+```
+
+**预检只读不写**，不会修改数据库、不会写入导入历史、不会产生审计日志。
+
+**成功时的响应**（全部可导入）：
+
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "rules_count": 2,
+  "success_count": 2,
+  "new_count": 2,
+  "overwritten_count": 0,
+  "skipped_count": 0,
+  "error_count": 0,
+  "disabled_blocked_count": 0,
+  "new_rules": [
+    {"code": "channel_a", "action": "would_create", "reason": "dry_run模式，仅预览不会实际创建"}
+  ],
+  "overwritten_rules": [],
+  "skipped_rules": [],
+  "conflict_rules": [],
+  "disabled_blocked_rules": [],
+  "invalid_rules": [],
+  "errors": [],
+  "imported_rules": [
+    {"code": "channel_a", "name": "A渠道补录", "dry_run": true}
+  ],
+  "operator": "admin_zhang",
+  "result_summary": "导入完成: 成功2条 (新增2条, 覆盖0条), 跳过0条, 失败0条, 禁用拦截0条 (dry_run预览)"
+}
+```
+
+**有冲突时**（`conflict_strategy=skip`）：
+
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "skipped_count": 1,
+  "skipped_rules": [
+    {
+      "code": "admin",
+      "action": "skipped",
+      "reason": "来源 code='admin' 已存在 (层级: runtime, 名称: 管理员后台)，跳过导入",
+      "existing_rule": {"code": "admin", "name": "管理员后台", "source_layer": "runtime", ...}
+    }
+  ],
+  "conflict_rules": [...]
+}
+```
+
+**有校验失败时**：
+
+```json
+{
+  "success": false,
+  "error_count": 1,
+  "invalid_rules": [
+    {
+      "code": "bad_rule",
+      "index": 2,
+      "reason": "验证失败: 缺少必填字段: name",
+      "incoming_rule": {"code": "bad_rule", "priority": 50}
+    }
+  ],
+  "errors": ["规则 bad_rule 验证失败: 缺少必填字段: name"]
+}
+```
+
+#### 第三步：正式导入
+
+确认预检结果无误后，去掉 `dry-run` 路径，使用正式导入接口：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/source-rules/import \
+  -H "Content-Type: application/json" \
+  -H "X-Operator: admin_zhang" \
+  -d '{
+    "rules": [
+      {"code": "channel_a", "name": "A渠道补录", "category": "onsite", "priority": 60, "is_enabled": true, "version": "1.0"},
+      {"code": "channel_b", "name": "B渠道补录", "category": "remote", "priority": 55, "match_pattern": "^b_.*", "is_enabled": true, "version": "1.0"}
+    ],
+    "conflict_strategy": "skip",
+    "dry_run": false
+  }'
+```
+
+**成功响应**：
+
+```json
+{
+  "success": true,
+  "dry_run": false,
+  "rules_count": 2,
+  "success_count": 2,
+  "new_count": 2,
+  "overwritten_count": 0,
+  "import_id": 1,
+  "new_rules": [
+    {"code": "channel_a", "action": "created", "reason": "成功创建新规则", "after": {...}}
+  ],
+  "imported_rules": [{...}],
+  "result_summary": "导入完成: 成功2条 (新增2条, 覆盖0条), 跳过0条, 失败0条, 禁用拦截0条"
+}
+```
+
+> **关键**：响应中的 `import_id` 是本次导入的批次号，后续可据此追查。
+
+#### 冲突策略说明
+
+| 策略 | 新规则 | 已有规则（runtime层） | 已有规则（default/env层） |
+|------|--------|----------------------|--------------------------|
+| `skip` | 正常创建 | 跳过，保留原有 | 跳过，保留原有 |
+| `overwrite` | 正常创建 | 覆盖更新 | 跳过（无法覆盖非runtime层） |
+| `report` | 正常创建 | 报错，导入失败 | 报错，导入失败 |
+
+> ⚠️ **安全提醒**：`overwrite` 策略仅能覆盖 runtime 层（数据库中）的规则。default 层和 environment 层的规则无法被导入操作覆盖。
+
+#### 禁用规则拦截
+
+当导入的规则会将一条**当前已启用的规则**改为**禁用**状态时（`is_enabled: true → false`），系统会在响应中标记：
+
+```json
+{
+  "disabled_blocked_count": 1,
+  "disabled_blocked_rules": [
+    {
+      "code": "channel_a",
+      "reason": "规则 channel_a 当前已启用，导入后将被禁用，这将阻止使用该来源的新补录请求",
+      "incoming_rule": {"code": "channel_a", "name": "A渠道补录", "is_enabled": false},
+      "existing_rule": {"code": "channel_a", "name": "A渠道补录", "is_enabled": true},
+      "impact": "导入后该来源将被禁用，新的补录请求会被拒绝，历史记录不受影响"
+    }
+  ]
+}
+```
+
+禁用后，使用该来源发起补录会被拦截：
+
+```json
+{
+  "detail": {
+    "code": "DISABLED_SOURCE_RULE",
+    "message": "来源规则 channel_a 已禁用，无法用于补录"
+  }
+}
+```
+
+#### 第四步：导入历史回看
+
+```bash
+# 查看全部导入历史
+curl http://127.0.0.1:8000/api/admin/source-rules/import-history
+
+# 按操作人过滤
+curl "http://127.0.0.1:8000/api/admin/source-rules/import-history?operator=admin_zhang"
+
+# 查看单次导入详情
+curl http://127.0.0.1:8000/api/admin/source-rules/import-history/1
+```
+
+**响应示例**：
+
+```json
+[
+  {
+    "id": 1,
+    "import_version": "1.0",
+    "rules_count": 2,
+    "success_count": 2,
+    "new_count": 2,
+    "overwritten_count": 0,
+    "skipped_count": 0,
+    "error_count": 0,
+    "disabled_blocked_count": 0,
+    "conflict_strategy": "skip",
+    "result_summary": "导入完成: 成功2条 ...",
+    "operator": "admin_zhang",
+    "created_at": "2026-06-19 14:30:00",
+    "summary": {
+      "effective_rules": ["channel_a", "channel_b"],
+      "new_rules": [{"code": "channel_a", "name": "A渠道补录"}],
+      "overwritten_rules": []
+    }
+  }
+]
+```
+
+#### 第五步：审计追查
+
+审计日志记录了规则的所有变更（创建、更新、删除、导入），并关联了 `import_id`。
+
+```bash
+# 查看全部审计日志
+curl http://127.0.0.1:8000/api/admin/source-rules/audit-log
+
+# 按规则code追查
+curl "http://127.0.0.1:8000/api/admin/source-rules/audit-log?rule_code=channel_a"
+
+# 按导入批次追查（将某次导入的所有规则变更串起来）
+curl "http://127.0.0.1:8000/api/admin/source-rules/audit-log?import_id=1"
+```
+
+**响应示例**：
+
+```json
+[
+  {
+    "id": 10,
+    "rule_code": "channel_a",
+    "operation": "create",
+    "operator": "admin_zhang",
+    "before": null,
+    "after": {"code": "channel_a", "name": "A渠道补录", ...},
+    "import_id": 1,
+    "remark": null,
+    "created_at": "2026-06-19 14:30:00"
+  }
+]
+```
+
+> **追查技巧**：先从 `/import-history` 找到 `import_id`，再用 `?import_id=1` 过滤审计日志，可以完整还原该次导入影响了哪些规则、变更前后的值。
+
+#### 第六步：导出与备份
+
+```bash
+# 导出所有启用的规则（JSON，默认）
+curl http://127.0.0.1:8000/api/admin/source-rules/export/json
+
+# 导出所有规则（含禁用的）
+curl "http://127.0.0.1:8000/api/admin/source-rules/export/json?only_enabled=false"
+
+# 导出含三层信息
+curl "http://127.0.0.1:8000/api/admin/source-rules/export/json?only_enabled=false&include_all_layers=true"
+
+# 导出 CSV
+curl "http://127.0.0.1:8000/api/admin/source-rules/export/csv?only_enabled=false"
+```
+
+**JSON 导出字段**：`code`, `name`, `description`, `category`, `priority`, `is_enabled`, `match_pattern`, `version`, `source_layer`, `created_at`, `updated_at`
+
+导出的 JSON 可直接作为导入数据使用（取 `rules` 数组即可）。
+
+#### 第七步：撤销后继续按来源追查
+
+补录订单撤销后，`source` 字段保持不变，仍可按来源追查：
+
+```bash
+# 按来源查补录记录（包含已撤销的）
+curl "http://127.0.0.1:8000/api/admin/orders/makeup?source=channel_a"
+```
+
+撤销后的记录特征：
+- `status` 为 `cancelled`
+- `revoked_at` 有值
+- `source` 仍为原补录来源
+- `matched_source_rule` 保留规则信息
+- `operation_logs` 包含 `create` 和 `revoke` 两条日志
+- `transactions` 包含 `FREEZE`、`SETTLE`、`MAKEUP_REVOKE` 三条流水
+
+#### 第八步：服务重启后历史仍可追查
+
+导入历史、审计日志、补录记录均存储在 SQLite 数据库中，服务重启后完全保留。
+
+验证方法：
+
+```bash
+# 1. 重启前记录状态
+curl http://127.0.0.1:8000/api/admin/source-rules/import-history
+curl http://127.0.0.1:8000/api/admin/source-rules/audit-log
+
+# 2. 重启服务
+# （停止再启动 uvicorn）
+
+# 3. 重启后验证
+curl http://127.0.0.1:8000/api/admin/source-rules/import-history
+curl "http://127.0.0.1:8000/api/admin/source-rules/audit-log?import_id=1"
+curl "http://127.0.0.1:8000/api/admin/orders/makeup?source=channel_a"
+```
+
+重启后按来源追查仍然可用，`import_id` 关联的审计日志仍然可查。
+
+### 结构化日志
+
+导入操作的每一步都会输出 JSON 格式的结构化日志，可通过 `import_id` 串联：
+
+```
+2026-06-19 14:30:00 - services.source_rule_service - INFO - {"event": "source_rule_import_created", "code": "channel_a", "operator": "admin_zhang", "dry_run": false}
+2026-06-19 14:30:00 - services.source_rule_service - INFO - {"event": "source_rules_import_completed", "import_id": 1, "success_count": 2, "new_count": 2, "operator": "admin_zhang"}
+```
+
+关键 `event` 值：
+
+| event | 含义 |
+|-------|------|
+| `source_rule_import_created` | 单条规则导入创建成功 |
+| `source_rule_import_overwrite` | 单条规则导入覆盖成功 |
+| `source_rule_import_skip` | 单条规则因冲突跳过 |
+| `source_rule_import_disabled_blocked` | 单条规则因禁用被标记 |
+| `source_rules_import_completed` | 整批导入完成，含 `import_id` |
+| `makeup_source_rule_matched` | 补录时来源规则命中 |
+| `makeup_source_rule_disabled` | 补录时来源规则禁用拦截 |
+| `makeup_source_unmatched` | 补录时来源未命中任何规则 |
+
+### 运行批量维护验收测试
+
+```bash
+python test_source_rules_batch_maintenance.py
+```
+
+覆盖场景：
+- Dry-run 预检（新增/冲突/校验失败分类明细，确认不写入数据库）
+- 正式导入（skip/overwrite 策略，导入历史记录，import_id 返回）
+- 禁用规则拦截检测（导入禁用规则后补录被拦截）
+- 导入后来源命中补录（精确匹配和模式匹配）
+- 撤销后继续按来源追查（source 保留、操作日志、流水完整）
+- 导出字段完整性（JSON/CSV 字段齐全）
+- 服务重启后持久化（规则、导入历史、补录记录、审计日志、对账一致）
+
 覆盖场景：
 - 成功补录
 - 重复补录冲突

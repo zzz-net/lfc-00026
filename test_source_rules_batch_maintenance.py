@@ -468,6 +468,13 @@ def test_02_formal_import_overwrite(ctx):
     if result.get("new_count") != 1 or result.get("overwritten_count") != 1 or result.get("success_count") != 2:
         ok = False
 
+    print_test("包含import_id", result.get("import_id") is not None,
+               f"import_id={result.get('import_id')}")
+    if result.get("import_id") is None:
+        ok = False
+
+    import_id = result.get("import_id")
+
     print_test("new_rules有1条", len(result.get("new_rules", [])) == 1,
                f"count={len(result.get('new_rules', []))}")
     print_test("overwritten_rules有1条", len(result.get("overwritten_rules", [])) == 1,
@@ -500,6 +507,33 @@ def test_02_formal_import_overwrite(ctx):
                f"operator={result.get('operator')}")
     if result.get("operator") != "admin_zhang":
         ok = False
+
+    if import_id:
+        r_audit = api("GET", f"/api/admin/source-rules/audit-log?import_id={import_id}")
+        if r_audit.status_code == 200:
+            audit_entries = r_audit.json()
+            print_test("审计日志按import_id过滤有记录",
+                       len(audit_entries) >= 2,
+                       f"audit_count={len(audit_entries)}")
+            if len(audit_entries) < 2:
+                ok = False
+
+            audit_codes = [e.get("rule_code") for e in audit_entries]
+            print_test("审计日志包含import_new_1",
+                       "import_new_1" in audit_codes,
+                       f"codes={audit_codes}")
+            print_test("审计日志包含to_overwrite",
+                       "to_overwrite" in audit_codes,
+                       f"codes={audit_codes}")
+            if "import_new_1" not in audit_codes or "to_overwrite" not in audit_codes:
+                ok = False
+
+            for entry in audit_entries:
+                print_test(f"审计[{entry.get('rule_code')}]import_id匹配",
+                           entry.get("import_id") == import_id,
+                           f"import_id={entry.get('import_id')}")
+                if entry.get("import_id") != import_id:
+                    ok = False
 
     r_rules = api("GET", "/api/admin/source-rules")
     rules_after = r_rules.json()
@@ -536,6 +570,15 @@ def test_02_formal_import_overwrite(ctx):
                f"history_count={len(history)}")
     if len(history) != 1:
         ok = False
+
+    r_history_by_op = api("GET", "/api/admin/source-rules/import-history", params={"operator": "admin_zhang"})
+    if r_history_by_op.status_code == 200:
+        history_by_op = r_history_by_op.json()
+        print_test("按operator过滤导入历史有结果",
+                   len(history_by_op) >= 1,
+                   f"count={len(history_by_op)}")
+        if len(history_by_op) < 1:
+            ok = False
 
     if history:
         latest = history[0]
@@ -1026,11 +1069,148 @@ def test_06_export_fields_completeness(ctx):
 
 
 # ============================================================
-# Test 7: Reboot persistence
+# Test 7: Report conflict strategy
 # ============================================================
 
-def test_07_reboot_persistence(ctx, process):
-    print_section("测试 7: 重启后规则和导入记录持久化")
+def test_07_report_conflict_strategy(ctx):
+    print_section("测试 7: Report 冲突策略")
+
+    ok = True
+
+    import_rules = [
+        {
+            "code": "admin",
+            "name": "尝试覆盖admin（report策略）",
+            "priority": 200,
+            "is_enabled": True,
+            "version": "1.0",
+        },
+        {
+            "code": "report_new_1",
+            "name": "Report策略新增规则",
+            "category": "import",
+            "priority": 50,
+            "is_enabled": True,
+            "version": "1.0",
+        },
+    ]
+
+    r = api("POST", "/api/admin/source-rules/import", json={
+        "rules": import_rules,
+        "conflict_strategy": "report",
+    }, headers={"X-Operator": "test_report_op"})
+
+    if r.status_code != 400:
+        print_test("report策略冲突返回400", False, f"状态码 {r.status_code}: {safe_json(r)}")
+        ok = False
+        return ok
+
+    detail = safe_json(r)
+    detail_data = detail.get("detail", detail)
+    print_test("返回SOURCE_RULE_IMPORT_ERROR",
+               detail_data.get("code") == "SOURCE_RULE_IMPORT_ERROR",
+               f"code={detail_data.get('code')}")
+    if detail_data.get("code") != "SOURCE_RULE_IMPORT_ERROR":
+        ok = False
+
+    r_rules = api("GET", "/api/admin/source-rules")
+    merged = r_rules.json().get("rules", [])
+    merged_codes = [r["code"] for r in merged]
+
+    print_test("admin规则未被覆盖",
+               any(r["code"] == "admin" and r["name"] == "管理员后台" for r in merged),
+               f"admin_in_merged={'admin' in merged_codes}")
+    print_test("report_new_1未被创建",
+               "report_new_1" not in merged_codes,
+               f"report_new_1_in_merged={'report_new_1' in merged_codes}")
+    if "report_new_1" in merged_codes:
+        ok = False
+
+    print_test("Report冲突策略总结果", ok)
+    return ok
+
+
+# ============================================================
+# Test 8: Audit import_id cross-reference and operator filter
+# ============================================================
+
+def test_08_audit_import_id_crossref(ctx):
+    print_section("测试 8: 审计日志 import_id 交叉追查与 operator 过滤")
+
+    ok = True
+
+    r_history = api("GET", "/api/admin/source-rules/import-history")
+    history = r_history.json()
+    print_test("导入历史有记录", len(history) >= 1,
+               f"count={len(history)}")
+    if len(history) < 1:
+        ok = False
+        print_test("审计日志import_id追查总结果", ok)
+        return ok
+
+    first_import = history[0]
+    import_id = first_import.get("id")
+    operator_val = first_import.get("operator")
+    print(f"  最早导入批次: import_id={import_id}, operator={operator_val}")
+
+    r_audit = api("GET", f"/api/admin/source-rules/audit-log?import_id={import_id}")
+    if r_audit.status_code != 200:
+        print_test("按import_id查审计日志返回200", False, f"状态码 {r_audit.status_code}")
+        ok = False
+    else:
+        audit_entries = r_audit.json()
+        print_test(f"import_id={import_id}关联审计日志有{len(audit_entries)}条",
+                   len(audit_entries) >= 1,
+                   f"count={len(audit_entries)}")
+        if len(audit_entries) < 1:
+            ok = False
+
+        for entry in audit_entries:
+            has_import_id = entry.get("import_id") == import_id
+            print_test(f"审计[{entry.get('rule_code')}]import_id={import_id}",
+                       has_import_id,
+                       f"actual={entry.get('import_id')}")
+            if not has_import_id:
+                ok = False
+
+    if operator_val:
+        r_history_op = api("GET", "/api/admin/source-rules/import-history",
+                           params={"operator": operator_val})
+        if r_history_op.status_code == 200:
+            op_history = r_history_op.json()
+            print_test(f"按operator={operator_val}过滤有结果",
+                       len(op_history) >= 1,
+                       f"count={len(op_history)}")
+            for h in op_history:
+                print_test(f"operator匹配",
+                           h.get("operator") == operator_val,
+                           f"operator={h.get('operator')}")
+                if h.get("operator") != operator_val:
+                    ok = False
+        else:
+            print_test("按operator过滤返回200", False, f"状态码 {r_history_op.status_code}")
+            ok = False
+
+    r_audit_all = api("GET", "/api/admin/source-rules/audit-log")
+    if r_audit_all.status_code == 200:
+        all_audit = r_audit_all.json()
+        with_import_id = [e for e in all_audit if e.get("import_id") is not None]
+        print_test("审计日志中有关联import_id的记录",
+                   len(with_import_id) >= 1,
+                   f"with_import_id={len(with_import_id)}, total={len(all_audit)}")
+        if len(with_import_id) < 1:
+            ok = False
+
+    print_test("审计日志import_id追查总结果", ok)
+    return ok
+
+
+# ============================================================
+# Test 9: Reboot persistence
+# =======================================================================
+
+def test_09_reboot_persistence(ctx, process):
+    print_section("测试 9: 重启后规则和导入记录持久化")
 
     print("  记录重启前状态...")
     rules_before = api("GET", "/api/admin/source-rules").json()
@@ -1144,6 +1324,26 @@ def test_07_reboot_persistence(ctx, process):
         if len(audit_logs) == 0:
             ok = False
 
+        with_import_id = [e for e in audit_logs if e.get("import_id") is not None]
+        print_test("重启后审计日志import_id保留",
+                   len(with_import_id) >= 1,
+                   f"with_import_id={len(with_import_id)}")
+        if len(with_import_id) < 1:
+            ok = False
+
+    if history_after:
+        first_import = history_after[0]
+        import_id_after = first_import.get("id")
+        if import_id_after:
+            r_audit_by_import = api("GET", f"/api/admin/source-rules/audit-log?import_id={import_id_after}")
+            if r_audit_by_import.status_code == 200:
+                audit_by_import = r_audit_by_import.json()
+                print_test(f"重启后按import_id={import_id_after}查审计日志可用",
+                           len(audit_by_import) >= 1,
+                           f"count={len(audit_by_import)}")
+                if len(audit_by_import) < 1:
+                    ok = False
+
     reconc_after = api("GET", "/api/admin/reconciliation").json()
     print_test("重启后对账通过", reconc_after["consistent"],
                f"Issues: {reconc_after.get('issues', [])}")
@@ -1175,7 +1375,9 @@ def main():
         test_04_source_hit_after_import(ctx)
         test_05_revoke_and_track_by_source(ctx)
         test_06_export_fields_completeness(ctx)
-        process, reboot_ok = test_07_reboot_persistence(ctx, process)
+        test_07_report_conflict_strategy(ctx)
+        test_08_audit_import_id_crossref(ctx)
+        process, reboot_ok = test_09_reboot_persistence(ctx, process)
 
     except Exception as e:
         print(f"\n  [FATAL] 测试执行出错: {e}")

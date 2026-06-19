@@ -244,6 +244,10 @@ def _init_source_rules_audit_log_table(cur):
     CREATE INDEX IF NOT EXISTS idx_source_rules_audit_op ON source_rules_audit_log(operation);
     CREATE INDEX IF NOT EXISTS idx_source_rules_audit_created ON source_rules_audit_log(created_at);
     """)
+    _add_column_if_not_exists(cur, "source_rules_audit_log", "import_id", "INTEGER")
+    cur.executescript("""
+    CREATE INDEX IF NOT EXISTS idx_source_rules_audit_import_id ON source_rules_audit_log(import_id);
+    """)
 
 
 def _init_source_rules_import_log_table(cur):
