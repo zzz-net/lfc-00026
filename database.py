@@ -151,6 +151,7 @@ def init_db():
     _init_source_rules_table(cur)
     _init_source_rules_import_log_table(cur)
     _init_source_rules_audit_log_table(cur)
+    _init_import_replay_tables(cur)
     _init_default_config(cur)
     _init_default_source_rules(cur)
 
@@ -225,6 +226,14 @@ def _init_source_rules_table(cur):
     """)
 
     _add_column_if_not_exists(cur, "source_rules", "category", "TEXT NOT NULL DEFAULT 'general'")
+    _add_column_if_not_exists(cur, "source_rules", "import_origin", "TEXT DEFAULT 'manual'")
+    _add_column_if_not_exists(cur, "source_rules", "import_job_id", "INTEGER")
+    _add_column_if_not_exists(cur, "source_rules", "last_manual_modified_at", "TEXT")
+    _add_column_if_not_exists(cur, "source_rules", "last_manual_modified_by", "TEXT")
+    cur.executescript("""
+    CREATE INDEX IF NOT EXISTS idx_source_rules_import_origin ON source_rules(import_origin);
+    CREATE INDEX IF NOT EXISTS idx_source_rules_import_job ON source_rules(import_job_id);
+    """)
 
 
 def _init_source_rules_audit_log_table(cur):
@@ -273,6 +282,107 @@ def _init_source_rules_import_log_table(cur):
     _add_column_if_not_exists(cur, "source_rules_import_log", "new_count", "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_not_exists(cur, "source_rules_import_log", "overwritten_count", "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_not_exists(cur, "source_rules_import_log", "disabled_blocked_count", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _init_import_replay_tables(cur):
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS source_rules_import_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        operator TEXT,
+        conflict_strategy TEXT NOT NULL,
+        rules_count INTEGER NOT NULL DEFAULT 0,
+        success_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        error_count INTEGER NOT NULL DEFAULT 0,
+        new_count INTEGER NOT NULL DEFAULT 0,
+        overwritten_count INTEGER NOT NULL DEFAULT 0,
+        conflict_count INTEGER NOT NULL DEFAULT 0,
+        is_revoked INTEGER NOT NULL DEFAULT 0,
+        revoked_at TEXT,
+        revoked_by TEXT,
+        revoked_reason TEXT,
+        result_summary TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS source_rules_import_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_job_id INTEGER NOT NULL,
+        rule_code TEXT NOT NULL,
+        rule_json TEXT NOT NULL,
+        snapshot_type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS source_rules_import_details (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_job_id INTEGER NOT NULL,
+        rule_code TEXT NOT NULL,
+        rule_index INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        incoming_rule_json TEXT,
+        before_rule_json TEXT,
+        after_rule_json TEXT,
+        diff_json TEXT,
+        disabled_blocked INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS source_rules_import_conflicts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_job_id INTEGER NOT NULL,
+        rule_code TEXT NOT NULL,
+        conflict_type TEXT NOT NULL,
+        detected_at TEXT NOT NULL,
+        expected_before_json TEXT,
+        actual_before_json TEXT,
+        diff_json TEXT,
+        resolver TEXT,
+        resolved_at TEXT,
+        resolution TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS source_rules_import_permissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        permission_type TEXT NOT NULL,
+        granted_by TEXT,
+        granted_at TEXT NOT NULL,
+        expires_at TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1
+    );
+    """)
+
+    cur.executescript("""
+    CREATE INDEX IF NOT EXISTS idx_import_jobs_status ON source_rules_import_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_import_jobs_operator ON source_rules_import_jobs(operator);
+    CREATE INDEX IF NOT EXISTS idx_import_jobs_created ON source_rules_import_jobs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_import_jobs_revoked ON source_rules_import_jobs(is_revoked);
+    CREATE INDEX IF NOT EXISTS idx_import_jobs_job_id ON source_rules_import_jobs(job_id);
+
+    CREATE INDEX IF NOT EXISTS idx_import_snapshots_job ON source_rules_import_snapshots(import_job_id);
+    CREATE INDEX IF NOT EXISTS idx_import_snapshots_code ON source_rules_import_snapshots(rule_code);
+    CREATE INDEX IF NOT EXISTS idx_import_snapshots_type ON source_rules_import_snapshots(snapshot_type);
+
+    CREATE INDEX IF NOT EXISTS idx_import_details_job ON source_rules_import_details(import_job_id);
+    CREATE INDEX IF NOT EXISTS idx_import_details_code ON source_rules_import_details(rule_code);
+    CREATE INDEX IF NOT EXISTS idx_import_details_status ON source_rules_import_details(status);
+    CREATE INDEX IF NOT EXISTS idx_import_details_action ON source_rules_import_details(action);
+
+    CREATE INDEX IF NOT EXISTS idx_import_conflicts_job ON source_rules_import_conflicts(import_job_id);
+    CREATE INDEX IF NOT EXISTS idx_import_conflicts_code ON source_rules_import_conflicts(rule_code);
+    CREATE INDEX IF NOT EXISTS idx_import_conflicts_type ON source_rules_import_conflicts(conflict_type);
+    CREATE INDEX IF NOT EXISTS idx_import_conflicts_resolved ON source_rules_import_conflicts(resolved_at);
+
+    CREATE INDEX IF NOT EXISTS idx_import_permissions_user ON source_rules_import_permissions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_import_permissions_type ON source_rules_import_permissions(permission_type);
+    """)
 
 
 def _init_default_source_rules(cur):

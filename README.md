@@ -109,6 +109,21 @@ python test_api.py
 | GET | /api/admin/menus/export/json | 导出菜单(JSON) |
 | GET | /api/admin/menus/export/csv | 导出菜单(CSV) |
 | GET | /api/admin/reconciliation | 对账检查 |
+| POST | /api/admin/source-rules | 创建来源规则 |
+| GET | /api/admin/source-rules | 获取所有来源规则 |
+| GET | /api/admin/source-rules/{code} | 获取单个来源规则 |
+| PATCH | /api/admin/source-rules/{code} | 更新来源规则 |
+| DELETE | /api/admin/source-rules/{code} | 删除来源规则 |
+| POST | /api/admin/source-rules/import | 批量导入来源规则 |
+| POST | /api/admin/source-rules/import/dry-run | 导入预检（dry-run） |
+| GET | /api/admin/source-rules/import-history | 导入历史 |
+| GET | /api/admin/source-rules/import-history/{id} | 导入详情 |
+| GET | /api/admin/source-rules/audit-log | 审计日志 |
+| GET | /api/admin/source-rules/export/json | 导出来源规则(JSON) |
+| GET | /api/admin/source-rules/export/csv | 导出来源规则(CSV) |
+| POST | /api/admin/orders/makeup | 补录取餐 |
+| GET | /api/admin/orders/makeup | 查询补录记录 |
+| POST | /api/admin/orders/makeup/{id}/revoke | 撤销补录 |
 
 ### 员工端接口
 

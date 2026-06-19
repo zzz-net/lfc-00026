@@ -27,6 +27,10 @@ class SourceRule:
     created_at: Optional[str]
     updated_at: Optional[str]
     source_layer: str = "runtime"
+    import_origin: Optional[str] = None
+    import_job_id: Optional[int] = None
+    last_manual_modified_at: Optional[str] = None
+    last_manual_modified_by: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,6 +46,10 @@ class SourceRule:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "source_layer": self.source_layer,
+            "import_origin": self.import_origin,
+            "import_job_id": self.import_job_id,
+            "last_manual_modified_at": self.last_manual_modified_at,
+            "last_manual_modified_by": self.last_manual_modified_by,
         }
 
 
@@ -210,6 +218,13 @@ class SourceRuleService:
         rows = conn.execute(
             "SELECT * FROM source_rules ORDER BY priority DESC, code ASC"
         ).fetchall()
+
+        def _get_field(row, field, default=None):
+            try:
+                return row[field]
+            except (KeyError, IndexError):
+                return default
+
         return [
             SourceRule(
                 id=row["id"],
@@ -224,6 +239,10 @@ class SourceRuleService:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 source_layer="runtime",
+                import_origin=_get_field(row, "import_origin"),
+                import_job_id=_get_field(row, "import_job_id"),
+                last_manual_modified_at=_get_field(row, "last_manual_modified_at"),
+                last_manual_modified_by=_get_field(row, "last_manual_modified_by"),
             )
             for row in rows
         ]
@@ -331,6 +350,11 @@ class SourceRuleService:
             "SELECT * FROM source_rules WHERE code = ?", (code,)
         ).fetchone()
         if row:
+            def _get_field(row, field, default=None):
+                try:
+                    return row[field]
+                except (KeyError, IndexError):
+                    return default
             return SourceRule(
                 id=row["id"],
                 code=row["code"],
@@ -344,6 +368,10 @@ class SourceRuleService:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 source_layer="runtime",
+                import_origin=_get_field(row, "import_origin"),
+                import_job_id=_get_field(row, "import_job_id"),
+                last_manual_modified_at=_get_field(row, "last_manual_modified_at"),
+                last_manual_modified_by=_get_field(row, "last_manual_modified_by"),
             )
         for r in SourceRuleService.get_default_rules():
             if r.code == code:
@@ -656,6 +684,9 @@ class SourceRuleService:
         priority: int = 0,
         is_enabled: bool = True,
         match_pattern: str = None,
+        operator: str = None,
+        is_import_operation: bool = False,
+        import_job_id: int = None,
         conn=None,
     ) -> SourceRule:
         rule_data = {
@@ -681,27 +712,47 @@ class SourceRuleService:
                 raise ValueError(f"来源规则 code={code} 已存在")
 
             now = now_str()
+            import_origin = "import" if is_import_operation else "manual"
+            last_manual_modified_at = None if is_import_operation else now
+            last_manual_modified_by = None if is_import_operation else operator
+
+            insert_fields = [
+                "code", "name", "description", "category", "priority", "is_enabled",
+                "match_pattern", "version", "created_at", "updated_at", "import_origin"
+            ]
+            insert_values = [
+                code, name, description, category, priority,
+                1 if is_enabled else 0, match_pattern,
+                SourceRuleService.RULES_VERSION, now, now, import_origin
+            ]
+
+            if import_job_id:
+                insert_fields.append("import_job_id")
+                insert_values.append(import_job_id)
+
+            if not is_import_operation:
+                insert_fields.append("last_manual_modified_at")
+                insert_fields.append("last_manual_modified_by")
+                insert_values.append(now)
+                insert_values.append(operator)
+
+            placeholders = ", ".join(["?"] * len(insert_fields))
+            field_names = ", ".join(insert_fields)
+
             conn_inner.execute(
-                """INSERT INTO source_rules 
-                   (code, name, description, category, priority, is_enabled, match_pattern, version, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    code,
-                    name,
-                    description,
-                    category,
-                    priority,
-                    1 if is_enabled else 0,
-                    match_pattern,
-                    SourceRuleService.RULES_VERSION,
-                    now,
-                    now,
-                ),
+                f"INSERT INTO source_rules ({field_names}) VALUES ({placeholders})",
+                tuple(insert_values),
             )
 
             row = conn_inner.execute(
                 "SELECT * FROM source_rules WHERE code = ?", (code,)
             ).fetchone()
+
+            def _get_field(row, field, default=None):
+                try:
+                    return row[field]
+                except (KeyError, IndexError):
+                    return default
 
             created_rule = SourceRule(
                 id=row["id"],
@@ -716,12 +767,19 @@ class SourceRuleService:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 source_layer="runtime",
+                import_origin=_get_field(row, "import_origin", import_origin),
+                import_job_id=_get_field(row, "import_job_id"),
+                last_manual_modified_at=_get_field(row, "last_manual_modified_at"),
+                last_manual_modified_by=_get_field(row, "last_manual_modified_by"),
             )
 
+            operation = "import_create" if is_import_operation else "create"
             SourceRuleService._write_audit_log(
                 rule_code=code,
-                operation="create",
+                operation=operation,
                 after_data=created_rule.to_dict(),
+                operator=operator,
+                import_id=import_job_id if is_import_operation else None,
                 conn=conn_inner,
             )
 
@@ -731,6 +789,7 @@ class SourceRuleService:
                 "name": name,
                 "category": category,
                 "priority": priority,
+                "operator": operator,
             }, ensure_ascii=False))
 
             SourceRuleService._invalidate_cache()
@@ -752,6 +811,10 @@ class SourceRuleService:
         priority: int = None,
         is_enabled: bool = None,
         match_pattern: str = None,
+        operator: str = None,
+        is_import_operation: bool = False,
+        import_job_id: int = None,
+        expected_before: Dict = None,
         conn=None,
     ) -> SourceRule:
         def _execute(conn_inner):
@@ -761,10 +824,25 @@ class SourceRuleService:
             if not existing:
                 raise ValueError(f"来源规则 code={code} 不存在")
 
+            def _get_field(row, field, default=None):
+                try:
+                    return row[field]
+                except (KeyError, IndexError):
+                    return default
+
             before_data = dict(existing)
             before_data["is_enabled"] = bool(before_data["is_enabled"])
             if "category" not in before_data:
                 before_data["category"] = "general"
+
+            if expected_before and not is_import_operation:
+                conflict = SourceRuleService._check_conflict(expected_before, before_data)
+                if conflict:
+                    raise ValueError(
+                        f"检测到冲突: 规则 {code} 在读取后被修改。"
+                        f" 期望: {json.dumps(expected_before, ensure_ascii=False)}"
+                        f" 实际: {json.dumps(before_data, ensure_ascii=False)}"
+                    )
 
             update_data = {}
             if name is not None:
@@ -793,6 +871,15 @@ class SourceRuleService:
             now = now_str()
             update_data["updated_at"] = now
 
+            if not is_import_operation:
+                update_data["last_manual_modified_at"] = now
+                update_data["last_manual_modified_by"] = operator
+                update_data["import_origin"] = "manual"
+
+            if is_import_operation and import_job_id:
+                update_data["import_job_id"] = import_job_id
+                update_data["import_origin"] = "import"
+
             set_clause = ", ".join(f"{k} = ?" for k in update_data.keys())
             values = list(update_data.values()) + [code]
 
@@ -818,15 +905,22 @@ class SourceRuleService:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 source_layer="runtime",
+                import_origin=_get_field(row, "import_origin"),
+                import_job_id=_get_field(row, "import_job_id"),
+                last_manual_modified_at=_get_field(row, "last_manual_modified_at"),
+                last_manual_modified_by=_get_field(row, "last_manual_modified_by"),
             )
 
             after_data = updated_rule.to_dict()
 
+            operation = "import_overwrite" if is_import_operation else "update"
             SourceRuleService._write_audit_log(
                 rule_code=code,
-                operation="update",
+                operation=operation,
                 before_data=before_data,
                 after_data=after_data,
+                operator=operator,
+                import_id=import_job_id if is_import_operation else None,
                 conn=conn_inner,
             )
 
@@ -836,6 +930,8 @@ class SourceRuleService:
                 "updated_fields": list(update_data.keys()),
                 "before": before_data,
                 "after": after_data,
+                "operator": operator,
+                "is_import_operation": is_import_operation,
             }, ensure_ascii=False))
 
             SourceRuleService._invalidate_cache()
@@ -849,7 +945,43 @@ class SourceRuleService:
             return _execute(conn)
 
     @staticmethod
-    def delete_rule(code: str, conn=None) -> bool:
+    def _check_conflict(expected: Dict, actual: Dict) -> Optional[Dict]:
+        compare_fields = ["name", "description", "category", "priority", "is_enabled", "match_pattern", "version", "updated_at"]
+        diff = {}
+        for field in compare_fields:
+            exp_val = expected.get(field)
+            act_val = actual.get(field)
+            if exp_val != act_val:
+                diff[field] = {"expected": exp_val, "actual": act_val}
+        return diff if diff else None
+
+    @staticmethod
+    def _compute_diff(before: Dict, after: Dict) -> Dict:
+        all_fields = set(list(before.keys()) + list(after.keys()))
+        changed_fields = []
+        field_changes = {}
+        for field in all_fields:
+            if field in ["id", "created_at", "updated_at", "source_layer"]:
+                continue
+            b_val = before.get(field)
+            a_val = after.get(field)
+            if b_val != a_val:
+                change = {"field": field, "before": b_val, "after": a_val}
+                changed_fields.append(change)
+                field_changes[field] = {"before": b_val, "after": a_val}
+        return {
+            "changed_fields": changed_fields,
+            "field_changes": field_changes,
+            "changed_count": len(changed_fields),
+        }
+
+    @staticmethod
+    def _generate_job_id() -> str:
+        import uuid
+        return f"IMP-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
+
+    @staticmethod
+    def delete_rule(code: str, operator: str = None, conn=None) -> bool:
         def _execute(conn_inner):
             existing = conn_inner.execute(
                 "SELECT * FROM source_rules WHERE code = ?", (code,)
@@ -868,6 +1000,7 @@ class SourceRuleService:
                 rule_code=code,
                 operation="delete",
                 before_data=before_data,
+                operator=operator,
                 conn=conn_inner,
             )
 
@@ -875,6 +1008,7 @@ class SourceRuleService:
                 "event": "source_rule_deleted",
                 "code": code,
                 "deleted_rule": before_data,
+                "operator": operator,
             }, ensure_ascii=False))
 
             SourceRuleService._invalidate_cache()
@@ -892,6 +1026,7 @@ class SourceRuleService:
         conflict_strategy: str = "skip",
         dry_run: bool = False,
         operator: str = None,
+        check_concurrent_modifications: bool = True,
         conn=None,
     ) -> Dict[str, Any]:
         if conflict_strategy not in SourceRuleService.CONFLICT_STRATEGIES:
@@ -903,13 +1038,24 @@ class SourceRuleService:
         results = {
             "success": True,
             "version": SourceRuleService.RULES_VERSION,
+            "job_id": None,
             "rules_count": len(rules_data),
             "success_count": 0,
             "skipped_count": 0,
             "error_count": 0,
             "new_count": 0,
             "overwritten_count": 0,
+            "conflict_count": 0,
             "disabled_blocked_count": 0,
+            "summary": {
+                "total": len(rules_data),
+                "success": 0,
+                "created": 0,
+                "overwritten": 0,
+                "skipped": 0,
+                "failed": 0,
+                "conflicts_detected": 0,
+            },
             "new_rules": [],
             "overwritten_rules": [],
             "skipped_rules": [],
@@ -928,21 +1074,52 @@ class SourceRuleService:
             results["errors"].append("导入数据必须是规则数组")
             return results
 
+        job_id = SourceRuleService._generate_job_id()
+        results["job_id"] = job_id
+
         def _execute(conn_inner):
             now = now_str()
-            existing_db_codes = {
-                row["code"]: dict(row) for row in conn_inner.execute(
-                    "SELECT * FROM source_rules"
-                ).fetchall()
-            }
-            for code in existing_db_codes:
-                existing_db_codes[code]["is_enabled"] = bool(existing_db_codes[code]["is_enabled"])
+            import_job_pk = None
+
+            if not dry_run:
+                conn_inner.execute(
+                    """INSERT INTO source_rules_import_jobs
+                       (job_id, status, operator, conflict_strategy, rules_count, created_at, updated_at)
+                       VALUES (?, 'processing', ?, ?, ?, ?, ?)""",
+                    (job_id, operator, conflict_strategy, len(rules_data), now, now),
+                )
+                job_row = conn_inner.execute(
+                    "SELECT last_insert_rowid() as id"
+                ).fetchone()
+                import_job_pk = job_row["id"] if job_row else None
+                results["import_job_id"] = import_job_pk
+
+            all_rules_rows = conn_inner.execute(
+                "SELECT * FROM source_rules"
+            ).fetchall()
+
+            def _row_to_dict(row):
+                d = dict(row)
+                d["is_enabled"] = bool(d["is_enabled"])
+                if "category" not in d:
+                    d["category"] = "general"
+                return d
+
+            existing_db_codes = {row["code"]: _row_to_dict(row) for row in all_rules_rows}
+
+            if not dry_run and import_job_pk:
+                import_codes = {r.get("code") for r in rules_data if isinstance(r, dict) and r.get("code")}
+                for code, rule_dict in existing_db_codes.items():
+                    if code in import_codes:
+                        conn_inner.execute(
+                            """INSERT INTO source_rules_import_snapshots
+                               (import_job_id, rule_code, rule_json, snapshot_type, created_at)
+                               VALUES (?, ?, ?, 'before_import', ?)""",
+                            (import_job_pk, code, json.dumps(rule_dict, ensure_ascii=False), now),
+                        )
 
             merged_rules = SourceRuleService.get_merged_rules(conn_inner)
             merged_codes = {r.code: r for r in merged_rules}
-
-            all_runtime_rules = SourceRuleService.get_runtime_rules(conn_inner)
-            all_runtime_dict = {r.code: r for r in all_runtime_rules}
 
             if conflict_strategy == "report":
                 report_conflicts = []
@@ -952,30 +1129,54 @@ class SourceRuleService:
                     code = rule_data.get("code", f"index={idx}")
                     if code in merged_codes or code in existing_db_codes:
                         existing = merged_codes.get(code)
+                        existing_dict = existing.to_dict() if existing else existing_db_codes.get(code, {})
                         report_conflicts.append({
                             "code": code,
                             "index": idx,
-                            "existing_rule": {
-                                "code": existing.code if existing else code,
-                                "name": existing.name if existing else existing_db_codes.get(code, {}).get("name"),
-                                "priority": existing.priority if existing else existing_db_codes.get(code, {}).get("priority"),
-                                "category": existing.category if existing else existing_db_codes.get(code, {}).get("category"),
-                                "is_enabled": existing.is_enabled if existing else existing_db_codes.get(code, {}).get("is_enabled"),
-                                "source_layer": existing.source_layer if existing else "runtime",
-                            } if code in merged_codes else {
-                                "code": code,
-                                "source_layer": "runtime",
-                                **existing_db_codes.get(code, {}),
-                            },
+                            "existing_rule": existing_dict,
                             "action": "reported",
                             "reason": f"来源 code='{code}' 已存在，冲突策略为 report，不执行导入",
                         })
                 if report_conflicts:
                     results["success"] = False
                     results["error_count"] = len(report_conflicts)
+                    results["conflict_count"] = len(report_conflicts)
                     results["conflict_rules"] = report_conflicts
                     results["errors"] = [c["reason"] for c in report_conflicts]
                     results["result_summary"] = f"导入失败: 发现{len(report_conflicts)}个冲突 (report策略，不做任何修改)"
+
+                    if not dry_run and import_job_pk:
+                        conn_inner.execute(
+                            """UPDATE source_rules_import_jobs SET
+                               status = 'failed',
+                               error_count = ?,
+                               conflict_count = ?,
+                               result_summary = ?,
+                               updated_at = ?
+                               WHERE id = ?""",
+                            (len(report_conflicts), len(report_conflicts), results["result_summary"], now, import_job_pk),
+                        )
+                        for conflict in report_conflicts:
+                            code = conflict["code"]
+                            expected = existing_db_codes.get(code, {})
+                            actual_row = conn_inner.execute(
+                                "SELECT * FROM source_rules WHERE code = ?", (code,)
+                            ).fetchone()
+                            actual = _row_to_dict(actual_row) if actual_row else {}
+                            diff = SourceRuleService._compute_diff(expected, actual)
+                            conn_inner.execute(
+                                """INSERT INTO source_rules_import_conflicts
+                                   (import_job_id, rule_code, conflict_type, detected_at,
+                                    expected_before_json, actual_before_json, diff_json, created_at)
+                                   VALUES (?, ?, 'pre_import_report', ?, ?, ?, ?, ?)""",
+                                (
+                                    import_job_pk, code, now,
+                                    json.dumps(expected, ensure_ascii=False),
+                                    json.dumps(actual, ensure_ascii=False),
+                                    json.dumps(diff, ensure_ascii=False),
+                                    now,
+                                ),
+                            )
                     return results
 
             for idx, rule_data in enumerate(rules_data):
@@ -994,6 +1195,19 @@ class SourceRuleService:
                         "reason": f"版本 {version} 不支持",
                         "incoming_rule": rule_data,
                     })
+                    if not dry_run and import_job_pk:
+                        conn_inner.execute(
+                            """INSERT INTO source_rules_import_details
+                               (import_job_id, rule_code, rule_index, action, status,
+                                incoming_rule_json, error_message, created_at)
+                               VALUES (?, ?, ?, 'invalid', 'error', ?, ?, ?)""",
+                            (
+                                import_job_pk, rule_identifier, idx,
+                                json.dumps(rule_data, ensure_ascii=False),
+                                f"版本 {version} 不支持",
+                                now,
+                            ),
+                        )
                     continue
 
                 is_valid, validation_errors = SourceRuleService.validate_rule_data(rule_data)
@@ -1008,23 +1222,69 @@ class SourceRuleService:
                         "reason": f"验证失败: {'; '.join(validation_errors)}",
                         "incoming_rule": rule_data,
                     })
+                    if not dry_run and import_job_pk:
+                        conn_inner.execute(
+                            """INSERT INTO source_rules_import_details
+                               (import_job_id, rule_code, rule_index, action, status,
+                                incoming_rule_json, error_message, created_at)
+                               VALUES (?, ?, ?, 'invalid', 'error', ?, ?, ?)""",
+                            (
+                                import_job_pk, rule_identifier, idx,
+                                json.dumps(rule_data, ensure_ascii=False),
+                                f"验证失败: {'; '.join(validation_errors)}",
+                                now,
+                            ),
+                        )
                     continue
 
                 code = rule_data["code"]
                 is_enabled_incoming = rule_data.get("is_enabled", True)
 
+                detected_conflict = None
+                if check_concurrent_modifications and code in existing_db_codes and not dry_run:
+                    current_row = conn_inner.execute(
+                        "SELECT * FROM source_rules WHERE code = ?", (code,)
+                    ).fetchone()
+                    current_dict = _row_to_dict(current_row) if current_row else {}
+                    expected_dict = existing_db_codes.get(code, {})
+                    conflict = SourceRuleService._check_conflict(expected_dict, current_dict)
+                    if conflict:
+                        results["conflict_count"] += 1
+                        conflict_entry = {
+                            "code": code,
+                            "index": idx,
+                            "incoming_rule": rule_data,
+                            "existing_rule": expected_dict,
+                            "actual_rule": current_dict,
+                            "diff": conflict,
+                            "action": "concurrent_modification_conflict",
+                            "reason": f"规则 {code} 在导入开始后被人工修改，存在并发冲突",
+                        }
+                        results["conflict_rules"].append(conflict_entry)
+
+                        if import_job_pk:
+                            conn_inner.execute(
+                                """INSERT INTO source_rules_import_conflicts
+                                   (import_job_id, rule_code, conflict_type, detected_at,
+                                    expected_before_json, actual_before_json, diff_json,
+                                    resolver, resolved_at, resolution, created_at)
+                                   VALUES (?, ?, 'concurrent_modification', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    import_job_pk, code, now,
+                                    json.dumps(expected_dict, ensure_ascii=False),
+                                    json.dumps(current_dict, ensure_ascii=False),
+                                    json.dumps(conflict, ensure_ascii=False),
+                                    operator, now,
+                                    f"按{conflict_strategy}策略继续执行导入",
+                                    now,
+                                ),
+                            )
+                        detected_conflict = conflict
+
                 conflict_with_merged = None
                 if code in merged_codes:
                     existing_rule = merged_codes[code]
-                    conflict_with_merged = {
-                        "code": existing_rule.code,
-                        "name": existing_rule.name,
-                        "priority": existing_rule.priority,
-                        "category": existing_rule.category,
-                        "is_enabled": existing_rule.is_enabled,
-                        "source_layer": existing_rule.source_layer,
-                        "match_pattern": existing_rule.match_pattern,
-                    }
+                    conflict_with_merged = existing_rule.to_dict()
 
                 conflict_with_db = code in existing_db_codes
                 existing_db_rule = existing_db_codes.get(code)
@@ -1041,17 +1301,8 @@ class SourceRuleService:
                             "code": code,
                             "index": idx,
                             "reason": block_reason,
-                            "incoming_rule": {
-                                "code": code,
-                                "name": rule_data.get("name"),
-                                "is_enabled": is_enabled_incoming,
-                            },
-                            "existing_rule": {
-                                "code": code,
-                                "name": existing_db_rule.get("name"),
-                                "is_enabled": existing_db_rule["is_enabled"],
-                                "source_layer": "runtime",
-                            },
+                            "incoming_rule": rule_data,
+                            "existing_rule": existing_db_rule,
                             "impact": "导入后该来源将被禁用，新的补录请求会被拒绝，历史记录不受影响",
                         }
                         results["disabled_blocked_rules"].append(block_entry)
@@ -1061,25 +1312,15 @@ class SourceRuleService:
                             "code": code,
                             "reason": block_reason,
                             "operator": operator,
+                            "job_id": job_id,
                         }, ensure_ascii=False))
 
                 detail_entry = {
                     "code": code,
                     "index": idx,
                     "strategy": conflict_strategy,
-                    "incoming_rule": {
-                        "code": code,
-                        "name": rule_data.get("name"),
-                        "priority": rule_data.get("priority", 0),
-                        "category": rule_data.get("category", "general"),
-                        "is_enabled": is_enabled_incoming,
-                        "match_pattern": rule_data.get("match_pattern"),
-                        "description": rule_data.get("description"),
-                    },
-                    "existing_rule": conflict_with_merged or (
-                        {"code": code, "source_layer": "runtime", **existing_db_rule}
-                        if existing_db_rule else None
-                    ),
+                    "incoming_rule": rule_data,
+                    "existing_rule": conflict_with_merged or existing_db_rule,
                     "disabled_blocked": disabled_blocked,
                 }
 
@@ -1096,12 +1337,27 @@ class SourceRuleService:
                             f"，跳过导入"
                         )
                         results["skipped_rules"].append(detail_entry)
+                        if not dry_run and import_job_pk:
+                            conn_inner.execute(
+                                """INSERT INTO source_rules_import_details
+                                   (import_job_id, rule_code, rule_index, action, status,
+                                    incoming_rule_json, before_rule_json, disabled_blocked, created_at)
+                                   VALUES (?, ?, ?, 'skip', 'skipped', ?, ?, ?, ?)""",
+                                (
+                                    import_job_pk, code, idx,
+                                    json.dumps(rule_data, ensure_ascii=False),
+                                    json.dumps(existing_db_rule, ensure_ascii=False) if existing_db_rule else None,
+                                    1 if disabled_blocked else 0,
+                                    now,
+                                ),
+                            )
                         logger.info(json.dumps({
                             "event": "source_rule_import_skip",
                             "code": code,
                             "existing_layer": conflict_with_merged["source_layer"] if conflict_with_merged else "runtime",
                             "operator": operator,
                             "dry_run": dry_run,
+                            "job_id": job_id,
                         }, ensure_ascii=False))
                         continue
 
@@ -1118,18 +1374,35 @@ class SourceRuleService:
                                 f"规则 {code} 存在于 {conflict_with_merged['source_layer']} 层"
                                 f" 但不在 runtime 数据库中，无法覆盖"
                             )
+                            if not dry_run and import_job_pk:
+                                conn_inner.execute(
+                                    """INSERT INTO source_rules_import_details
+                                       (import_job_id, rule_code, rule_index, action, status,
+                                        incoming_rule_json, error_message, created_at)
+                                       VALUES (?, ?, ?, 'skip_non_runtime', 'skipped', ?, ?, ?)""",
+                                    (
+                                        import_job_pk, code, idx,
+                                        json.dumps(rule_data, ensure_ascii=False),
+                                        f"存在于 {conflict_with_merged['source_layer']} 层但不在 runtime 数据库中，无法覆盖",
+                                        now,
+                                    ),
+                                )
                             logger.warning(json.dumps({
                                 "event": "source_rule_import_skip_not_runtime",
                                 "code": code,
                                 "existing_layer": conflict_with_merged["source_layer"],
                                 "operator": operator,
                                 "dry_run": dry_run,
+                                "job_id": job_id,
                             }, ensure_ascii=False))
                             continue
 
                         if dry_run:
                             detail_entry["action"] = "would_overwrite"
                             detail_entry["reason"] = "dry_run模式，仅预览不会实际覆盖"
+                            detail_entry["before"] = existing_db_rule
+                            detail_entry["after"] = {**existing_db_rule, **rule_data}
+                            detail_entry["diff"] = SourceRuleService._compute_diff(existing_db_rule, {**existing_db_rule, **rule_data})
                             results["overwritten_rules"].append(detail_entry)
                             results["overwritten_count"] += 1
                             results["success_count"] += 1
@@ -1145,31 +1418,55 @@ class SourceRuleService:
                                 priority=rule_data.get("priority", 0),
                                 is_enabled=is_enabled_incoming,
                                 match_pattern=rule_data.get("match_pattern"),
+                                operator=operator,
+                                is_import_operation=True,
+                                import_job_id=import_job_pk,
                                 conn=conn_inner,
                             )
+                            after_data = updated.to_dict()
+                            diff = SourceRuleService._compute_diff(before_data, after_data)
+
                             results["success_count"] += 1
                             results["overwritten_count"] += 1
                             detail_entry["action"] = "overwritten"
                             detail_entry["reason"] = (
                                 f"已存在(层级: {conflict_with_merged['source_layer'] if conflict_with_merged else 'runtime'})，"
-                                f"覆盖更新; 变更: "
-                                f"name={before_data.get('name')}->{rule_data.get('name')}, "
-                                f"priority={before_data.get('priority')}->{rule_data.get('priority', 0)}, "
-                                f"category={before_data.get('category')}->{rule_data.get('category', 'general')}, "
-                                f"is_enabled={before_data.get('is_enabled')}->{is_enabled_incoming}"
+                                f"覆盖更新"
                             )
                             detail_entry["before"] = before_data
-                            detail_entry["after"] = updated.to_dict()
+                            detail_entry["after"] = after_data
+                            detail_entry["diff"] = diff
                             results["overwritten_rules"].append(detail_entry)
-                            results["imported_rules"].append(updated.to_dict())
-                            existing_db_codes[code] = updated.to_dict()
+                            results["imported_rules"].append(after_data)
+                            existing_db_codes[code] = after_data
+
+                            if import_job_pk:
+                                conn_inner.execute(
+                                    """INSERT INTO source_rules_import_details
+                                       (import_job_id, rule_code, rule_index, action, status,
+                                        incoming_rule_json, before_rule_json, after_rule_json,
+                                        diff_json, disabled_blocked, created_at)
+                                       VALUES (?, ?, ?, 'overwrite', 'success', ?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        import_job_pk, code, idx,
+                                        json.dumps(rule_data, ensure_ascii=False),
+                                        json.dumps(before_data, ensure_ascii=False),
+                                        json.dumps(after_data, ensure_ascii=False),
+                                        json.dumps(diff, ensure_ascii=False),
+                                        1 if disabled_blocked else 0,
+                                        now,
+                                    ),
+                                )
+
                             logger.info(json.dumps({
                                 "event": "source_rule_import_overwrite",
                                 "code": code,
                                 "before": before_data,
-                                "after": updated.to_dict(),
+                                "after": after_data,
+                                "diff": diff,
                                 "operator": operator,
                                 "dry_run": dry_run,
+                                "job_id": job_id,
                             }, ensure_ascii=False))
                             continue
                         except ValueError as e:
@@ -1177,6 +1474,20 @@ class SourceRuleService:
                             results["errors"].append(
                                 f"规则 {code} 更新失败: {str(e)}"
                             )
+                            if not dry_run and import_job_pk:
+                                conn_inner.execute(
+                                    """INSERT INTO source_rules_import_details
+                                       (import_job_id, rule_code, rule_index, action, status,
+                                        incoming_rule_json, before_rule_json, error_message, created_at)
+                                       VALUES (?, ?, ?, 'overwrite', 'error', ?, ?, ?, ?)""",
+                                    (
+                                        import_job_pk, code, idx,
+                                        json.dumps(rule_data, ensure_ascii=False),
+                                        json.dumps(existing_db_rule, ensure_ascii=False),
+                                        str(e),
+                                        now,
+                                    ),
+                                )
                             continue
 
                     elif conflict_strategy == "report":
@@ -1198,22 +1509,17 @@ class SourceRuleService:
                 if dry_run:
                     results["success_count"] += 1
                     results["new_count"] += 1
+                    after_data = {**rule_data, "code": code}
                     new_entry = {
                         **detail_entry,
                         "action": "would_create",
                         "reason": "dry_run模式，仅预览不会实际创建",
                         "dry_run": True,
+                        "after": after_data,
+                        "diff": SourceRuleService._compute_diff({}, after_data),
                     }
                     results["new_rules"].append(new_entry)
-                    results["imported_rules"].append({
-                        "code": code,
-                        "name": rule_data.get("name"),
-                        "category": rule_data.get("category", "general"),
-                        "priority": rule_data.get("priority", 0),
-                        "is_enabled": is_enabled_incoming,
-                        "match_pattern": rule_data.get("match_pattern"),
-                        "dry_run": True,
-                    })
+                    results["imported_rules"].append(after_data)
                     continue
 
                 try:
@@ -1225,31 +1531,95 @@ class SourceRuleService:
                         priority=rule_data.get("priority", 0),
                         is_enabled=is_enabled_incoming,
                         match_pattern=rule_data.get("match_pattern"),
+                        operator=operator,
+                        is_import_operation=True,
+                        import_job_id=import_job_pk,
                         conn=conn_inner,
                     )
+
+                    if import_job_pk:
+                        created_row = conn_inner.execute(
+                            "SELECT * FROM source_rules WHERE code = ?", (code,)
+                        ).fetchone()
+                        created_dict = _row_to_dict(created_row)
+                        created = SourceRule(
+                            id=created_dict["id"],
+                            code=created_dict["code"],
+                            name=created_dict["name"],
+                            description=created_dict["description"],
+                            category=created_dict.get("category", "general"),
+                            priority=created_dict["priority"],
+                            is_enabled=bool(created_dict["is_enabled"]),
+                            match_pattern=created_dict["match_pattern"],
+                            version=created_dict["version"],
+                            created_at=created_dict["created_at"],
+                            updated_at=created_dict["updated_at"],
+                            source_layer="runtime",
+                            import_origin=created_dict.get("import_origin"),
+                            import_job_id=created_dict.get("import_job_id"),
+                            last_manual_modified_at=created_dict.get("last_manual_modified_at"),
+                            last_manual_modified_by=created_dict.get("last_manual_modified_by"),
+                        )
+
+                    after_data = created.to_dict()
+                    diff = SourceRuleService._compute_diff({}, after_data)
+
                     results["success_count"] += 1
                     results["new_count"] += 1
                     new_entry = {
                         **detail_entry,
                         "action": "created",
                         "reason": "成功创建新规则",
-                        "after": created.to_dict(),
+                        "after": after_data,
+                        "diff": diff,
                     }
                     results["new_rules"].append(new_entry)
-                    results["imported_rules"].append(created.to_dict())
-                    existing_db_codes[code] = created.to_dict()
+                    results["imported_rules"].append(after_data)
+                    existing_db_codes[code] = after_data
+
+                    if import_job_pk:
+                        conn_inner.execute(
+                            """INSERT INTO source_rules_import_details
+                               (import_job_id, rule_code, rule_index, action, status,
+                                incoming_rule_json, after_rule_json, diff_json,
+                                disabled_blocked, created_at)
+                               VALUES (?, ?, ?, 'create', 'success', ?, ?, ?, ?, ?)""",
+                            (
+                                import_job_pk, code, idx,
+                                json.dumps(rule_data, ensure_ascii=False),
+                                json.dumps(after_data, ensure_ascii=False),
+                                json.dumps(diff, ensure_ascii=False),
+                                1 if disabled_blocked else 0,
+                                now,
+                            ),
+                        )
+
                     logger.info(json.dumps({
                         "event": "source_rule_import_created",
                         "code": code,
-                        "rule": created.to_dict(),
+                        "rule": after_data,
                         "operator": operator,
                         "dry_run": dry_run,
+                        "job_id": job_id,
                     }, ensure_ascii=False))
                 except ValueError as e:
                     results["error_count"] += 1
                     results["errors"].append(
                         f"规则 {code} 创建失败: {str(e)}"
                     )
+                    if not dry_run and import_job_pk:
+                        conn_inner.execute(
+                            """INSERT INTO source_rules_import_details
+                               (import_job_id, rule_code, rule_index, action, status,
+                                incoming_rule_json, error_message, created_at)
+                               VALUES (?, ?, ?, 'create', 'error', ?, ?, ?)""",
+                            (
+                                import_job_pk, code, idx,
+                                json.dumps(rule_data, ensure_ascii=False),
+                                str(e),
+                                now,
+                            ),
+                        )
 
             results["success"] = results["error_count"] == 0
 
@@ -1258,12 +1628,40 @@ class SourceRuleService:
                 f"(新增{results['new_count']}条, 覆盖{results['overwritten_count']}条), "
                 f"跳过{results['skipped_count']}条, "
                 f"失败{results['error_count']}条, "
+                f"冲突{results['conflict_count']}条, "
                 f"禁用拦截{results['disabled_blocked_count']}条"
                 f"{' (dry_run预览)' if dry_run else ''}"
             )
             results["result_summary"] = result_summary
 
-            if not dry_run:
+            if not dry_run and import_job_pk:
+                final_status = "completed" if results["success"] else "completed_with_errors"
+                conn_inner.execute(
+                    """UPDATE source_rules_import_jobs SET
+                       status = ?,
+                       success_count = ?,
+                       skipped_count = ?,
+                       error_count = ?,
+                       new_count = ?,
+                       overwritten_count = ?,
+                       conflict_count = ?,
+                       result_summary = ?,
+                       updated_at = ?
+                       WHERE id = ?""",
+                    (
+                        final_status,
+                        results["success_count"],
+                        results["skipped_count"],
+                        results["error_count"],
+                        results["new_count"],
+                        results["overwritten_count"],
+                        results["conflict_count"],
+                        result_summary,
+                        now,
+                        import_job_pk,
+                    ),
+                )
+
                 effective_rules = [r["code"] for r in results["new_rules"] + results["overwritten_rules"]]
                 details_json = json.dumps({
                     "new_rules": results["new_rules"],
@@ -1319,11 +1717,14 @@ class SourceRuleService:
                     "event": "source_rules_import_completed",
                     "summary": result_summary,
                     "import_id": import_id,
+                    "import_job_id": import_job_pk,
+                    "job_id": job_id,
                     "success_count": results["success_count"],
                     "new_count": results["new_count"],
                     "overwritten_count": results["overwritten_count"],
                     "skipped_count": results["skipped_count"],
                     "error_count": results["error_count"],
+                    "conflict_count": results["conflict_count"],
                     "disabled_blocked_count": results["disabled_blocked_count"],
                     "conflict_strategy": conflict_strategy,
                     "effective_rules": effective_rules,
@@ -1334,6 +1735,16 @@ class SourceRuleService:
                 if results["success_count"] > 0 or results["skipped_count"] > 0:
                     SourceRuleService._invalidate_cache()
                     SourceRuleService.ensure_cache_fresh()
+
+            results["summary"] = {
+                "total": results["rules_count"],
+                "success": results["success_count"],
+                "created": results["new_count"],
+                "overwritten": results["overwritten_count"],
+                "skipped": results["skipped_count"],
+                "failed": results["error_count"],
+                "conflicts_detected": results["conflict_count"],
+            }
 
             return results
 
@@ -1525,3 +1936,1212 @@ class SourceRuleService:
         }, ensure_ascii=False))
 
         return history
+
+    # ================================================
+    # 导入回放中心 - 权限控制
+    # ================================================
+
+    @staticmethod
+    def _get_permission_type_name(permission_type: str) -> str:
+        permission_map = {
+            "import_audit_view": "导入审计查看",
+            "import_audit_export": "导入审计导出",
+            "import_revoke": "导入撤销",
+            "import_manage": "导入管理",
+        }
+        return permission_map.get(permission_type, permission_type)
+
+    @staticmethod
+    def check_import_audit_permission(user_id: str, permission_type: str = "import_audit_view", conn=None) -> bool:
+        if conn is None:
+            conn = get_db()
+        if not user_id:
+            logger.warning(json.dumps({
+                "event": "import_audit_permission_denied",
+                "reason": "user_id_empty",
+                "user_id": user_id,
+                "permission_type": permission_type,
+            }, ensure_ascii=False))
+            return False
+
+        row = conn.execute(
+            """SELECT * FROM source_rules_import_permissions 
+               WHERE user_id = ? AND permission_type = ? AND is_active = 1
+               ORDER BY granted_at DESC LIMIT 1""",
+            (user_id, permission_type),
+        ).fetchone()
+
+        if not row:
+            logger.warning(json.dumps({
+                "event": "import_audit_permission_denied",
+                "reason": "no_permission_record",
+                "user_id": user_id,
+                "permission_type": permission_type,
+            }, ensure_ascii=False))
+            return False
+
+        perm = dict(row)
+        if perm.get("expires_at"):
+            try:
+                from datetime import datetime
+                exp_time = datetime.strptime(perm["expires_at"], "%Y-%m-%d %H:%M:%S")
+                now = datetime.now()
+                if now > exp_time:
+                    logger.warning(json.dumps({
+                        "event": "import_audit_permission_denied",
+                        "reason": "permission_expired",
+                        "user_id": user_id,
+                        "permission_type": permission_type,
+                        "expires_at": perm["expires_at"],
+                    }, ensure_ascii=False))
+                    return False
+            except Exception:
+                pass
+
+        logger.info(json.dumps({
+            "event": "import_audit_permission_granted",
+            "user_id": user_id,
+            "permission_type": permission_type,
+            "granted_by": perm.get("granted_by"),
+        }, ensure_ascii=False))
+        return True
+
+    @staticmethod
+    def _mask_sensitive_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        masked = dict(data)
+        sensitive_patterns = ["remark", "description", "match_pattern"]
+        for key in masked:
+            if isinstance(key, str) and any(p in key.lower() for p in sensitive_patterns):
+                if masked[key] and isinstance(masked[key], str) and len(masked[key]) > 10:
+                    masked[key] = masked[key][:5] + "***" + masked[key][-3:] if len(masked[key]) > 8 else "***"
+        return masked
+
+    # ================================================
+    # 导入回放中心 - 作业查询
+    # ================================================
+
+    @staticmethod
+    def list_import_jobs(
+        user_id: str = None,
+        status: str = None,
+        operator: str = None,
+        is_revoked: bool = None,
+        start_time: str = None,
+        end_time: str = None,
+        page: int = 1,
+        page_size: int = 20,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        conditions = []
+        params = []
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if operator:
+            conditions.append("operator = ?")
+            params.append(operator)
+        if is_revoked is not None:
+            conditions.append("is_revoked = ?")
+            params.append(1 if is_revoked else 0)
+        if start_time:
+            conditions.append("created_at >= ?")
+            params.append(start_time)
+        if end_time:
+            conditions.append("created_at <= ?")
+            params.append(end_time)
+
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        count_row = conn.execute(
+            f"SELECT COUNT(*) as total FROM source_rules_import_jobs{where_clause}",
+            params,
+        ).fetchone()
+        total = count_row["total"] if count_row else 0
+
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""SELECT * FROM source_rules_import_jobs{where_clause}
+               ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+            params + [page_size, offset],
+        ).fetchall()
+
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            job["is_revoked"] = bool(job["is_revoked"])
+
+            if not has_audit_permission:
+                job = SourceRuleService._mask_sensitive_data(job)
+                if "result_summary" in job:
+                    job["result_summary"] = "*** 需导入审计权限查看 ***"
+
+            jobs.append(job)
+
+        logger.info(json.dumps({
+            "event": "import_jobs_list_query",
+            "count": len(jobs),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_audit_permission": has_audit_permission,
+            "jobs": jobs,
+        }
+
+    @staticmethod
+    def get_import_job(
+        job_id: str,
+        user_id: str = None,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        row = conn.execute(
+            "SELECT * FROM source_rules_import_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+
+        if not row:
+            raise ValueError(f"导入作业 {job_id} 不存在")
+
+        job = dict(row)
+        job["is_revoked"] = bool(job["is_revoked"])
+
+        if not has_audit_permission:
+            job = SourceRuleService._mask_sensitive_data(job)
+            job["result_summary"] = "*** 需导入审计权限查看详细信息 ***"
+
+        logger.info(json.dumps({
+            "event": "import_job_detail_query",
+            "job_id": job_id,
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "has_audit_permission": has_audit_permission,
+            "job_id": job.get("job_id"),
+            "operator": job.get("operator"),
+            "conflict_strategy": job.get("conflict_strategy"),
+            "is_revoked": job.get("is_revoked"),
+            "revoked_at": job.get("revoked_at"),
+            "revoked_by": job.get("revoked_by"),
+            "revoked_reason": job.get("revoked_reason"),
+            "status": job.get("status"),
+            "rules_count": job.get("rules_count"),
+            "success_count": job.get("success_count"),
+            "overwritten_count": job.get("overwritten_count"),
+            "new_count": job.get("new_count"),
+            "skipped_count": job.get("skipped_count"),
+            "error_count": job.get("error_count"),
+            "conflict_count": job.get("conflict_count"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "result_summary": job.get("result_summary"),
+            "job": job,
+        }
+
+    # ================================================
+    # 导入回放中心 - 明细与差异
+    # ================================================
+
+    @staticmethod
+    def get_import_job_details(
+        job_id: str,
+        user_id: str = None,
+        status_filter: str = None,
+        page: int = 1,
+        page_size: int = 50,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        job_row = conn.execute(
+            "SELECT id FROM source_rules_import_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not job_row:
+            raise ValueError(f"导入作业 {job_id} 不存在")
+
+        import_job_pk = job_row["id"]
+
+        conditions = ["import_job_id = ?"]
+        params = [import_job_pk]
+
+        if status_filter:
+            conditions.append("status = ?")
+            params.append(status_filter)
+
+        where_clause = " AND ".join(conditions)
+
+        count_row = conn.execute(
+            f"SELECT COUNT(*) as total FROM source_rules_import_details WHERE {where_clause}",
+            params,
+        ).fetchone()
+        total = count_row["total"] if count_row else 0
+
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""SELECT * FROM source_rules_import_details 
+               WHERE {where_clause}
+               ORDER BY rule_index ASC LIMIT ? OFFSET ?""",
+            params + [page_size, offset],
+        ).fetchall()
+
+        details = []
+        for row in rows:
+            detail = dict(row)
+
+            field_mapping = {
+                "incoming_rule_json": "incoming",
+                "before_rule_json": "before",
+                "after_rule_json": "after",
+                "diff_json": "diff",
+            }
+            for json_field, key in field_mapping.items():
+                if detail.get(json_field):
+                    try:
+                        detail[key] = json.loads(detail[json_field])
+                        if not has_audit_permission:
+                            detail[key] = SourceRuleService._mask_sensitive_data(detail[key])
+                    except json.JSONDecodeError:
+                        detail[key] = None
+                else:
+                    detail[key] = None
+                detail.pop(json_field, None)
+
+            detail["disabled_blocked"] = bool(detail["disabled_blocked"])
+
+            if not has_audit_permission and "error_message" in detail:
+                detail["error_message"] = "*** 需导入审计权限查看 ***"
+
+            details.append(detail)
+
+        logger.info(json.dumps({
+            "event": "import_job_details_query",
+            "job_id": job_id,
+            "count": len(details),
+            "total": total,
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_audit_permission": has_audit_permission,
+            "details": details,
+        }
+
+    @staticmethod
+    def get_import_job_snapshots(
+        job_id: str,
+        user_id: str = None,
+        snapshot_type: str = "before_import",
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        job_row = conn.execute(
+            "SELECT id FROM source_rules_import_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not job_row:
+            raise ValueError(f"导入作业 {job_id} 不存在")
+
+        import_job_pk = job_row["id"]
+
+        rows = conn.execute(
+            """SELECT * FROM source_rules_import_snapshots 
+               WHERE import_job_id = ? AND snapshot_type = ?
+               ORDER BY rule_code ASC""",
+            (import_job_pk, snapshot_type),
+        ).fetchall()
+
+        snapshots = []
+        for row in rows:
+            snap = dict(row)
+            try:
+                snap["rule_json"] = json.loads(snap["rule_json"]) if snap["rule_json"] else None
+                if snap["rule_json"] and not has_audit_permission:
+                    snap["rule_json"] = SourceRuleService._mask_sensitive_data(snap["rule_json"])
+            except json.JSONDecodeError:
+                snap["rule_json"] = None
+            snapshots.append(snap)
+
+        logger.info(json.dumps({
+            "event": "import_job_snapshots_query",
+            "job_id": job_id,
+            "snapshot_type": snapshot_type,
+            "count": len(snapshots),
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "snapshot_type": snapshot_type,
+            "has_audit_permission": has_audit_permission,
+            "snapshots": snapshots,
+        }
+
+    @staticmethod
+    def get_import_job_conflicts(
+        job_id: str,
+        user_id: str = None,
+        include_resolved: bool = True,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        job_row = conn.execute(
+            "SELECT id FROM source_rules_import_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not job_row:
+            raise ValueError(f"导入作业 {job_id} 不存在")
+
+        import_job_pk = job_row["id"]
+
+        conditions = ["import_job_id = ?"]
+        params = [import_job_pk]
+
+        if not include_resolved:
+            conditions.append("resolved_at IS NULL")
+
+        where_clause = " AND ".join(conditions)
+
+        rows = conn.execute(
+            f"""SELECT * FROM source_rules_import_conflicts 
+               WHERE {where_clause}
+               ORDER BY detected_at DESC""",
+            params,
+        ).fetchall()
+
+        conflicts = []
+        for row in rows:
+            conflict = dict(row)
+
+            for json_field in ["expected_before_json", "actual_before_json", "diff_json"]:
+                if conflict.get(json_field):
+                    try:
+                        key = json_field.replace("_json", "")
+                        conflict[key] = json.loads(conflict[json_field])
+                        if conflict[key] and not has_audit_permission:
+                            conflict[key] = SourceRuleService._mask_sensitive_data(conflict[key])
+                    except json.JSONDecodeError:
+                        key = json_field.replace("_json", "")
+                        conflict[key] = None
+                conflict.pop(json_field, None)
+
+            conflict["is_resolved"] = 1 if conflict.get("resolved_at") else 0
+
+            if conflict.get("diff") and isinstance(conflict["diff"], dict):
+                detected_changes = []
+                for field, values in conflict["diff"].items():
+                    if isinstance(values, dict):
+                        detected_changes.append({
+                            "field": field,
+                            "expected": values.get("expected"),
+                            "actual": values.get("actual"),
+                        })
+                conflict["detected_changes"] = detected_changes
+            else:
+                conflict["detected_changes"] = []
+
+            if not has_audit_permission:
+                if "resolution" in conflict:
+                    conflict["resolution"] = "*** 需导入审计权限查看 ***"
+
+            conflicts.append(conflict)
+
+        logger.info(json.dumps({
+            "event": "import_job_conflicts_query",
+            "job_id": job_id,
+            "count": len(conflicts),
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "has_audit_permission": has_audit_permission,
+            "conflicts": conflicts,
+        }
+
+    # ================================================
+    # 导入回放中心 - 撤销功能
+    # ================================================
+
+    @staticmethod
+    def revoke_import_job(
+        job_id: str,
+        operator: str = None,
+        user_id: str = None,
+        reason: str = None,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_revoke_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_revoke", conn
+        ) if user_id else False
+
+        if not has_revoke_permission:
+            return {
+                "success": False,
+                "has_revoke_permission": False,
+                "message": "没有撤销导入的权限，请联系管理员授权",
+            }
+
+        def _execute(conn_inner):
+            now = now_str()
+
+            job_row = conn_inner.execute(
+                "SELECT * FROM source_rules_import_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+
+            if not job_row:
+                raise ValueError(f"导入作业 {job_id} 不存在")
+
+            if job_row["is_revoked"]:
+                raise ValueError(f"导入作业 {job_id} 已被撤销")
+
+            import_job_pk = job_row["id"]
+
+            snapshot_rows = conn_inner.execute(
+                """SELECT * FROM source_rules_import_snapshots 
+                   WHERE import_job_id = ? AND snapshot_type = 'before_import'""",
+                (import_job_pk,),
+            ).fetchall()
+
+            snapshot_rules = {}
+            for snap in snapshot_rows:
+                try:
+                    rule_data = json.loads(snap["rule_json"])
+                    snapshot_rules[snap["rule_code"]] = rule_data
+                except json.JSONDecodeError:
+                    continue
+
+            detail_rows = conn_inner.execute(
+                """SELECT * FROM source_rules_import_details 
+                   WHERE import_job_id = ? AND status = 'success'
+                   ORDER BY rule_index ASC""",
+                (import_job_pk,),
+            ).fetchall()
+
+            revoke_results = {
+                "restored": [],
+                "deleted": [],
+                "skipped": [],
+                "errors": [],
+            }
+
+            for detail in detail_rows:
+                rule_code = detail["rule_code"]
+                action = detail["action"]
+
+                try:
+                    if action == "create":
+                        conn_inner.execute(
+                            "DELETE FROM source_rules WHERE code = ?",
+                            (rule_code,),
+                        )
+                        revoke_results["deleted"].append({
+                            "code": rule_code,
+                            "action": "deleted",
+                            "reason": "撤销导入时删除导入创建的规则",
+                        })
+
+                        SourceRuleService._write_audit_log(
+                            rule_code=rule_code,
+                            operation="delete",
+                            before_data=json.loads(detail["after_rule_json"]) if detail["after_rule_json"] else None,
+                            operator=operator,
+                            remark=f"撤销导入作业 {job_id}",
+                            conn=conn_inner,
+                        )
+
+                    elif action == "overwrite":
+                        before_data = snapshot_rules.get(rule_code)
+                        if before_data:
+                            update_fields = {}
+                            for field in ["name", "description", "category", "priority", "is_enabled", "match_pattern", "version"]:
+                                if field in before_data:
+                                    val = before_data[field]
+                                    if field == "is_enabled":
+                                        update_fields[field] = 1 if val else 0
+                                    else:
+                                        update_fields[field] = val
+
+                            update_fields["updated_at"] = now
+                            update_fields["import_origin"] = before_data.get("import_origin", "manual")
+                            update_fields["import_job_id"] = before_data.get("import_job_id")
+                            update_fields["last_manual_modified_at"] = before_data.get("last_manual_modified_at")
+                            update_fields["last_manual_modified_by"] = before_data.get("last_manual_modified_by")
+
+                            set_clause = ", ".join(f"{k} = ?" for k in update_fields.keys())
+                            values = list(update_fields.values()) + [rule_code]
+
+                            conn_inner.execute(
+                                f"UPDATE source_rules SET {set_clause} WHERE code = ?",
+                                values,
+                            )
+
+                            revoke_results["restored"].append({
+                                "code": rule_code,
+                                "action": "restored",
+                                "reason": "撤销导入时恢复导入覆盖前的规则",
+                            })
+
+                            SourceRuleService._write_audit_log(
+                                rule_code=rule_code,
+                                operation="update",
+                                before_data=json.loads(detail["after_rule_json"]) if detail["after_rule_json"] else None,
+                                after_data=before_data,
+                                operator=operator,
+                                remark=f"撤销导入作业 {job_id}",
+                                conn=conn_inner,
+                            )
+                        else:
+                            revoke_results["skipped"].append({
+                                "code": rule_code,
+                                "action": "skipped",
+                                "reason": "未找到导入前的快照数据，无法恢复",
+                            })
+
+                    else:
+                        revoke_results["skipped"].append({
+                            "code": rule_code,
+                            "action": "skipped",
+                            "reason": f"不支持撤销操作类型: {action}",
+                        })
+
+                except Exception as e:
+                    revoke_results["errors"].append({
+                        "code": rule_code,
+                        "error": str(e),
+                    })
+
+            after_snapshots = {}
+            current_rows = conn_inner.execute(
+                "SELECT * FROM source_rules"
+            ).fetchall()
+            for r in current_rows:
+                d = dict(r)
+                d["is_enabled"] = bool(d["is_enabled"])
+                if "category" not in d:
+                    d["category"] = "general"
+                after_snapshots[d["code"]] = d
+                conn_inner.execute(
+                    """INSERT INTO source_rules_import_snapshots
+                       (import_job_id, rule_code, rule_json, snapshot_type, created_at)
+                       VALUES (?, ?, ?, 'after_revoke', ?)""",
+                    (import_job_pk, d["code"], json.dumps(d, ensure_ascii=False), now),
+                )
+
+            conn_inner.execute(
+                """UPDATE source_rules_import_jobs SET
+                   is_revoked = 1,
+                   revoked_at = ?,
+                   revoked_by = ?,
+                   revoked_reason = ?,
+                   updated_at = ?
+                   WHERE id = ?""",
+                (now, operator, reason, now, import_job_pk),
+            )
+
+            SourceRuleService._invalidate_cache()
+            SourceRuleService.ensure_cache_fresh()
+
+            result_summary = (
+                f"撤销完成: 恢复{len(revoke_results['restored'])}条, "
+                f"删除{len(revoke_results['deleted'])}条, "
+                f"跳过{len(revoke_results['skipped'])}条, "
+                f"失败{len(revoke_results['errors'])}条"
+            )
+
+            logger.info(json.dumps({
+                "event": "import_job_revoked",
+                "job_id": job_id,
+                "import_job_pk": import_job_pk,
+                "operator": operator,
+                "user_id": user_id,
+                "reason": reason,
+                "result_summary": result_summary,
+                "revoke_results": revoke_results,
+            }, ensure_ascii=False))
+
+            return {
+                "success": True,
+                "has_revoke_permission": True,
+                "job_id": job_id,
+                "revoked_at": now,
+                "revoked_by": operator,
+                "reason": reason,
+                "result_summary": result_summary,
+                "revoke_results": revoke_results,
+            }
+
+        try:
+            if conn is None:
+                with transaction() as conn:
+                    return _execute(conn)
+            else:
+                return _execute(conn)
+        except ValueError as e:
+            return {
+                "success": False,
+                "has_revoke_permission": True,
+                "message": str(e),
+            }
+
+    @staticmethod
+    def get_import_replay_data(
+        job_id: str,
+        user_id: str = None,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        job_row = conn.execute(
+            "SELECT * FROM source_rules_import_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not job_row:
+            raise ValueError(f"导入作业 {job_id} 不存在")
+
+        if not job_row["is_revoked"]:
+            return {
+                "success": True,
+                "job_id": job_id,
+                "is_revoked": False,
+                "message": "该作业尚未撤销，无可回放数据",
+            }
+
+        import_job_pk = job_row["id"]
+
+        before_rows = conn.execute(
+            """SELECT * FROM source_rules_import_snapshots 
+               WHERE import_job_id = ? AND snapshot_type = 'before_import'""",
+            (import_job_pk,),
+        ).fetchall()
+
+        after_revoke_rows = conn.execute(
+            """SELECT * FROM source_rules_import_snapshots 
+               WHERE import_job_id = ? AND snapshot_type = 'after_revoke'""",
+            (import_job_pk,),
+        ).fetchall()
+
+        detail_rows = conn.execute(
+            """SELECT * FROM source_rules_import_details 
+               WHERE import_job_id = ? AND status = 'success'
+               ORDER BY rule_index ASC""",
+            (import_job_pk,),
+        ).fetchall()
+
+        def _parse_snapshot(rows):
+            result = {}
+            for r in rows:
+                try:
+                    rule_data = json.loads(r["rule_json"])
+                    if not has_audit_permission:
+                        rule_data = SourceRuleService._mask_sensitive_data(rule_data)
+                    result[r["rule_code"]] = rule_data
+                except json.JSONDecodeError:
+                    continue
+            return result
+
+        def _parse_details(rows):
+            result = []
+            for r in rows:
+                d = dict(r)
+                field_mapping = {
+                    "incoming_rule_json": "incoming",
+                    "before_rule_json": "before",
+                    "after_rule_json": "after",
+                    "diff_json": "diff",
+                }
+                for jf, key in field_mapping.items():
+                    if d.get(jf):
+                        try:
+                            d[key] = json.loads(d[jf])
+                            if not has_audit_permission:
+                                d[key] = SourceRuleService._mask_sensitive_data(d[key])
+                        except json.JSONDecodeError:
+                            d[key] = None
+                    else:
+                        d[key] = None
+                    d.pop(jf, None)
+                d["disabled_blocked"] = bool(d["disabled_blocked"])
+                result.append(d)
+            return result
+
+        before_snapshot = _parse_snapshot(before_rows)
+        after_revoke_snapshot = _parse_snapshot(after_revoke_rows)
+        details = _parse_details(detail_rows)
+
+        replay_steps = []
+        all_verified = True
+        for detail in details:
+            code = detail["rule_code"]
+            step = {
+                "code": code,
+                "rule_code": code,
+                "action": detail["action"],
+                "import_action": detail["action"],
+                "revoke_action": "restored" if detail["action"] == "overwrite" else "deleted",
+                "before_import": before_snapshot.get(code),
+                "after_import": detail.get("after"),
+                "after_revoke": after_revoke_snapshot.get(code),
+                "import_diff": detail.get("diff"),
+                "diff": detail.get("diff"),
+            }
+
+            if before_snapshot.get(code) and after_revoke_snapshot.get(code):
+                before_clean = {k: v for k, v in before_snapshot[code].items() if k != "updated_at"}
+                after_clean = {k: v for k, v in after_revoke_snapshot[code].items() if k != "updated_at"}
+                step["verify_result"] = "matched" if before_clean == after_clean else "mismatched"
+                if step["verify_result"] == "mismatched":
+                    all_verified = False
+                    step["verify_diff"] = SourceRuleService._compute_diff(
+                        before_snapshot[code], after_revoke_snapshot[code]
+                    )
+                else:
+                    step["verify_diff"] = None
+            else:
+                step["verify_result"] = "no_snapshot"
+                step["verify_diff"] = None
+                if detail["action"] == "create" and after_revoke_snapshot.get(code) is None:
+                    step["verify_result"] = "matched"
+                else:
+                    all_verified = False
+
+            replay_steps.append(step)
+
+        logger.info(json.dumps({
+            "event": "import_replay_data_query",
+            "job_id": job_id,
+            "has_audit_permission": has_audit_permission,
+            "steps_count": len(replay_steps),
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "is_revoked": 1,
+            "has_audit_permission": has_audit_permission,
+            "revoke_verification_passed": all_verified,
+            "revoked_at": job_row["revoked_at"],
+            "revoked_by": job_row["revoked_by"],
+            "revoked_reason": job_row["revoked_reason"],
+            "before_snapshot": before_snapshot,
+            "after_revoke_snapshot": after_revoke_snapshot,
+            "import_details": details,
+            "replay_steps": replay_steps,
+            "replay_data": replay_steps,
+        }
+
+    # ================================================
+    # 导入回放中心 - 导出功能
+    # ================================================
+
+    @staticmethod
+    def export_import_job_json(
+        job_id: str,
+        user_id: str = None,
+        export_type: str = "full",
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_export_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_export", conn
+        ) if user_id else False
+
+        if not has_export_permission:
+            return {
+                "success": False,
+                "has_export_permission": False,
+                "message": "没有导出导入审计数据的权限",
+            }
+
+        job_info = SourceRuleService.get_import_job(job_id, user_id, conn)
+        details = SourceRuleService.get_import_job_details(job_id, user_id, page_size=10000, conn=conn)
+        snapshots = SourceRuleService.get_import_job_snapshots(job_id, user_id, conn=conn)
+        conflicts = SourceRuleService.get_import_job_conflicts(job_id, user_id, conn=conn)
+        audit_log = SourceRuleService.get_audit_log(import_id=job_info.get("job", {}).get("id"), limit=10000, conn=conn)
+
+        export_data = {
+            "export_version": "1.0",
+            "exported_at": now_str(),
+            "export_type": export_type,
+            "job_id": job_id,
+            "job": job_info.get("job", {}),
+            "summary": {
+                "total": job_info.get("rules_count", 0),
+                "success": job_info.get("success_count", 0),
+                "created": job_info.get("new_count", 0),
+                "overwritten": job_info.get("overwritten_count", 0),
+                "skipped": job_info.get("skipped_count", 0),
+                "failed": job_info.get("error_count", 0),
+                "conflicts_detected": job_info.get("conflict_count", 0),
+            },
+        }
+
+        if export_type in ["full", "details"]:
+            export_data["details"] = details.get("details", [])
+        if export_type in ["full", "snapshots"]:
+            export_data["snapshots"] = snapshots.get("snapshots", [])
+        if export_type in ["full", "conflicts"]:
+            export_data["conflicts"] = conflicts.get("conflicts", [])
+        if export_type in ["full", "audit_log"]:
+            export_data["audit_log"] = audit_log
+
+        logger.info(json.dumps({
+            "event": "import_job_exported_json",
+            "job_id": job_id,
+            "export_type": export_type,
+            "records_count": len(details.get("details", [])),
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "has_export_permission": True,
+            "content_type": "application/json",
+            "filename": f"import_job_{job_id}_{export_type}_{now_str().replace(':', '-')}.json",
+            "data": export_data,
+        }
+
+    @staticmethod
+    def export_import_job_csv(
+        job_id: str,
+        user_id: str = None,
+        export_type: str = "details",
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_export_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_export", conn
+        ) if user_id else False
+
+        if not has_export_permission:
+            return {
+                "success": False,
+                "has_export_permission": False,
+                "message": "没有导出导入审计数据的权限",
+            }
+
+        csv_lines = []
+
+        if export_type == "details":
+            details = SourceRuleService.get_import_job_details(job_id, user_id, page_size=10000, conn=conn)
+            headers = [
+                "rule_code", "action", "status", "rule_index",
+                "incoming_rule_code", "incoming_rule_name",
+                "before_rule_code", "before_rule_name",
+                "after_rule_code", "after_rule_name",
+                "diff_summary", "error_message", "created_at"
+            ]
+            csv_lines.append(",".join(headers))
+
+            for d in details.get("details", []):
+                inc = d.get("incoming", {}) or {}
+                bef = d.get("before", {}) or {}
+                aft = d.get("after", {}) or {}
+                diff = d.get("diff", {}) or {}
+                diff_fields = [cf.get("field", "") for cf in diff.get("changed_fields", [])][:5]
+                row = [
+                    f'"{d.get("rule_code", "")}"',
+                    f'"{d.get("action", "")}"',
+                    f'"{d.get("status", "")}"',
+                    str(d.get("rule_index", "")),
+                    f'"{inc.get("code", "")}"',
+                    f'"{inc.get("name", "")}"',
+                    f'"{bef.get("code", "")}"',
+                    f'"{bef.get("name", "")}"',
+                    f'"{aft.get("code", "")}"',
+                    f'"{aft.get("name", "")}"',
+                    f'"{", ".join(diff_fields)}"',
+                    f'"{(d.get("error_message") or "").replace('"', '""')}"',
+                    f'"{d.get("created_at", "")}"',
+                ]
+                csv_lines.append(",".join(row))
+
+        elif export_type == "diff":
+            details = SourceRuleService.get_import_job_details(job_id, user_id, page_size=10000, conn=conn)
+            headers = ["rule_code", "field", "old_value", "new_value"]
+            csv_lines.append(",".join(headers))
+
+            for d in details.get("details", []):
+                diff = d.get("diff", {}) or {}
+                for change in diff.get("changed_fields", []):
+                    field = change.get("field", "")
+                    old_value = str(change.get("before", ""))
+                    new_value = str(change.get("after", ""))
+                    row = [
+                        f'"{d.get("rule_code", "")}"',
+                        f'"{field}"',
+                        f'"{old_value.replace('"', '""')}"',
+                        f'"{new_value.replace('"', '""')}"',
+                    ]
+                    csv_lines.append(",".join(row))
+
+        elif export_type == "conflicts":
+            conflicts = SourceRuleService.get_import_job_conflicts(job_id, user_id, conn=conn)
+            headers = [
+                "rule_code", "conflict_type", "detected_at",
+                "expected_value", "actual_value", "diff_fields",
+                "resolver", "resolved_at", "resolution"
+            ]
+            csv_lines.append(",".join(headers))
+
+            for c in conflicts.get("conflicts", []):
+                diff = c.get("diff", {}) or {}
+                diff_fields = list(diff.keys())
+                row = [
+                    f'"{c.get("rule_code", "")}"',
+                    f'"{c.get("conflict_type", "")}"',
+                    f'"{c.get("detected_at", "")}"',
+                    f'"{json.dumps(c.get("expected_before", {}), ensure_ascii=False).replace('"', '""')}"',
+                    f'"{json.dumps(c.get("actual_before", {}), ensure_ascii=False).replace('"', '""')}"',
+                    f'"{", ".join(diff_fields)}"',
+                    f'"{c.get("resolver", "")}"',
+                    f'"{c.get("resolved_at", "")}"',
+                    f'"{(c.get("resolution") or "").replace('"', '""')}"',
+                ]
+                csv_lines.append(",".join(row))
+
+        csv_content = "\n".join(csv_lines)
+
+        logger.info(json.dumps({
+            "event": "import_job_exported_csv",
+            "job_id": job_id,
+            "export_type": export_type,
+            "lines_count": len(csv_lines),
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "has_export_permission": True,
+            "content_type": "text/csv",
+            "filename": f"import_job_{job_id}_{export_type}_{now_str().replace(':', '-')}.csv",
+            "data": csv_content,
+        }
+
+    @staticmethod
+    def get_structured_audit_log(
+        user_id: str = None,
+        job_id: str = None,
+        rule_code: str = None,
+        operation: str = None,
+        start_time: str = None,
+        end_time: str = None,
+        page: int = 1,
+        page_size: int = 50,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        has_audit_permission = SourceRuleService.check_import_audit_permission(
+            user_id, "import_audit_view", conn
+        ) if user_id else False
+
+        conditions = []
+        params = []
+
+        if job_id:
+            job_row = conn.execute(
+                "SELECT id FROM source_rules_import_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_row:
+                conditions.append("import_id = ?")
+                params.append(job_row["id"])
+
+        if rule_code:
+            conditions.append("rule_code = ?")
+            params.append(rule_code)
+        if operation:
+            conditions.append("operation = ?")
+            params.append(operation)
+        if start_time:
+            conditions.append("created_at >= ?")
+            params.append(start_time)
+        if end_time:
+            conditions.append("created_at <= ?")
+            params.append(end_time)
+
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        count_row = conn.execute(
+            f"SELECT COUNT(*) as total FROM source_rules_audit_log{where_clause}",
+            params,
+        ).fetchone()
+        total = count_row["total"] if count_row else 0
+
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""SELECT * FROM source_rules_audit_log{where_clause}
+               ORDER BY id DESC LIMIT ? OFFSET ?""",
+            params + [page_size, offset],
+        ).fetchall()
+
+        entries = []
+        for row in rows:
+            entry = dict(row)
+
+            for json_field in ["before_json", "after_json"]:
+                if entry.get(json_field):
+                    try:
+                        key = json_field.replace("_json", "")
+                        entry[key] = json.loads(entry[json_field])
+                        if entry[key] and not has_audit_permission:
+                            entry[key] = SourceRuleService._mask_sensitive_data(entry[key])
+                    except json.JSONDecodeError:
+                        key = json_field.replace("_json", "")
+                        entry[key] = None
+                entry.pop(json_field, None)
+
+            if entry.get("before") and entry.get("after"):
+                entry["diff"] = SourceRuleService._compute_diff(entry["before"], entry["after"])
+            else:
+                entry["diff"] = None
+
+            entry["has_diff"] = 1 if entry.get("diff") and entry["diff"].get("changed_count", 0) > 0 else 0
+            entry["timestamp"] = entry.get("created_at")
+
+            if entry.get("import_id"):
+                entry["import_job_id"] = entry["import_id"]
+
+            if entry.get("before") and not has_audit_permission:
+                entry["before"] = SourceRuleService._mask_sensitive_data(entry["before"])
+            if entry.get("after") and not has_audit_permission:
+                entry["after"] = SourceRuleService._mask_sensitive_data(entry["after"])
+            if entry.get("diff") and not has_audit_permission:
+                entry["diff"] = SourceRuleService._mask_sensitive_data(entry["diff"])
+            if entry.get("remark") and not has_audit_permission:
+                entry["remark"] = "*** 需导入审计权限查看 ***"
+
+            entries.append(entry)
+
+        logger.info(json.dumps({
+            "event": "structured_audit_log_query",
+            "count": len(entries),
+            "total": total,
+            "has_audit_permission": has_audit_permission,
+            "user_id": user_id,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_audit_permission": has_audit_permission,
+            "audit_logs": entries,
+        }
+
+    # ================================================
+    # 导入回放中心 - 权限管理
+    # ================================================
+
+    @staticmethod
+    def grant_import_permission(
+        target_user_id: str,
+        permission_type: str,
+        granted_by: str = None,
+        expires_at: str = None,
+        conn=None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            conn = get_db()
+
+        valid_permissions = ["import_audit_view", "import_audit_export", "import_revoke", "import_manage"]
+        if permission_type not in valid_permissions:
+            raise ValueError(
+                f"无效的权限类型: {permission_type}，支持的权限: {', '.join(valid_permissions)}"
+            )
+
+        now = now_str()
+        conn.execute(
+            """INSERT INTO source_rules_import_permissions
+               (user_id, permission_type, granted_by, granted_at, expires_at, is_active)
+               VALUES (?, ?, ?, ?, ?, 1)""",
+            (target_user_id, permission_type, granted_by, now, expires_at),
+        )
+
+        logger.info(json.dumps({
+            "event": "import_permission_granted",
+            "target_user_id": target_user_id,
+            "permission_type": permission_type,
+            "permission_name": SourceRuleService._get_permission_type_name(permission_type),
+            "granted_by": granted_by,
+            "expires_at": expires_at,
+        }, ensure_ascii=False))
+
+        return {
+            "success": True,
+            "message": f"已为用户 {target_user_id} 授予权限: {SourceRuleService._get_permission_type_name(permission_type)}",
+            "permission_type": permission_type,
+            "permission_name": SourceRuleService._get_permission_type_name(permission_type),
+            "target_user_id": target_user_id,
+            "granted_at": now,
+            "expires_at": expires_at,
+        }

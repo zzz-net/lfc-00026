@@ -168,6 +168,17 @@ class SourceRulesImportRequest(BaseModel):
     rules: List[dict]
     conflict_strategy: str = "skip"
     dry_run: bool = False
+    check_concurrent_modifications: bool = True
+
+
+class ImportRevokeRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class GrantImportPermissionRequest(BaseModel):
+    target_user_id: str
+    permission_type: str
+    expires_at: Optional[str] = None
 
 
 # ========== Error Helper ==========
@@ -484,7 +495,10 @@ def admin_list_source_rules():
 
 
 @app.post("/api/admin/source-rules", tags=["管理员"], summary="创建来源规则")
-def admin_create_source_rule(data: SourceRuleCreate):
+def admin_create_source_rule(
+    data: SourceRuleCreate,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+):
     try:
         rule = SourceRuleService.create_rule(
             code=data.code,
@@ -494,6 +508,7 @@ def admin_create_source_rule(data: SourceRuleCreate):
             priority=data.priority,
             is_enabled=data.is_enabled,
             match_pattern=data.match_pattern,
+            operator=x_operator,
         )
         return rule.to_dict()
     except ValueError as e:
@@ -504,7 +519,7 @@ def admin_create_source_rule(data: SourceRuleCreate):
             error_response(msg, "SOURCE_RULE_VALIDATION_ERROR", 400)
 
 
-@app.post("/api/admin/source-rules/import", tags=["管理员"], summary="批量导入来源规则（支持dry-run预检）")
+@app.post("/api/admin/source-rules/import", tags=["管理员"], summary="批量导入来源规则（支持dry-run预检、并发冲突检测）")
 def admin_import_source_rules(
     data: SourceRulesImportRequest,
     x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
@@ -515,6 +530,7 @@ def admin_import_source_rules(
             conflict_strategy=data.conflict_strategy,
             dry_run=data.dry_run,
             operator=x_operator,
+            check_concurrent_modifications=data.check_concurrent_modifications,
         )
         if not result["success"]:
             return JSONResponse(
@@ -543,6 +559,7 @@ def admin_import_source_rules_dry_run(
             conflict_strategy=data.conflict_strategy,
             dry_run=True,
             operator=x_operator,
+            check_concurrent_modifications=data.check_concurrent_modifications,
         )
         return result
     except ValueError as e:
@@ -616,7 +633,11 @@ def admin_get_source_rule(code: str):
 
 
 @app.patch("/api/admin/source-rules/{code}", tags=["管理员"], summary="更新来源规则")
-def admin_update_source_rule(code: str, data: SourceRuleUpdate):
+def admin_update_source_rule(
+    code: str,
+    data: SourceRuleUpdate,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+):
     try:
         rule = SourceRuleService.update_rule(
             code=code,
@@ -626,6 +647,7 @@ def admin_update_source_rule(code: str, data: SourceRuleUpdate):
             priority=data.priority,
             is_enabled=data.is_enabled,
             match_pattern=data.match_pattern,
+            operator=x_operator,
         )
         return rule.to_dict()
     except ValueError as e:
@@ -637,9 +659,12 @@ def admin_update_source_rule(code: str, data: SourceRuleUpdate):
 
 
 @app.delete("/api/admin/source-rules/{code}", tags=["管理员"], summary="删除来源规则")
-def admin_delete_source_rule(code: str):
+def admin_delete_source_rule(
+    code: str,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+):
     try:
-        SourceRuleService.delete_rule(code)
+        SourceRuleService.delete_rule(code, operator=x_operator)
         return {"success": True, "message": f"来源规则 {code} 已删除"}
     except ValueError as e:
         msg = str(e)
@@ -647,6 +672,334 @@ def admin_delete_source_rule(code: str):
             error_response(msg, "SOURCE_RULE_NOT_FOUND", 404)
         else:
             error_response(msg, "SOURCE_RULE_ERROR", 400)
+
+
+# ========== 管理员 - 导入回放中心 ==========
+
+
+@app.get("/api/admin/import-replay/jobs", tags=["导入回放中心"], summary="查询导入作业列表")
+def admin_list_import_jobs(
+    status: Optional[str] = Query(None, description="按状态过滤: pending/processing/completed/completed_with_errors/failed"),
+    operator: Optional[str] = Query(None, description="按操作人过滤"),
+    is_revoked: Optional[bool] = Query(None, description="是否已撤销"),
+    start_time: Optional[str] = Query(None, description="开始时间 YYYY-MM-DD HH:MM:SS"),
+    end_time: Optional[str] = Query(None, description="结束时间 YYYY-MM-DD HH:MM:SS"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        return SourceRuleService.list_import_jobs(
+            user_id=x_user_id,
+            status=status,
+            operator=operator,
+            is_revoked=is_revoked,
+            start_time=start_time,
+            end_time=end_time,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as e:
+        error_response(str(e), "IMPORT_REPLAY_ERROR", 400)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}", tags=["导入回放中心"], summary="获取导入作业详情")
+def admin_get_import_job(
+    job_id: str,
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_import_job(job_id, user_id=x_user_id)
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/details", tags=["导入回放中心"], summary="获取导入作业明细（逐条规则）")
+def admin_get_import_job_details(
+    job_id: str,
+    status_filter: Optional[str] = Query(None, description="按状态过滤: success/skipped/error"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(50, ge=1, le=500, description="每页条数"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_import_job_details(
+            job_id=job_id,
+            user_id=x_user_id,
+            status_filter=status_filter,
+            page=page,
+            page_size=page_size,
+        )
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/snapshots", tags=["导入回放中心"], summary="获取导入作业快照")
+def admin_get_import_job_snapshots(
+    job_id: str,
+    snapshot_type: str = Query("before_import", description="快照类型: before_import/after_revoke"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_import_job_snapshots(
+            job_id=job_id,
+            user_id=x_user_id,
+            snapshot_type=snapshot_type,
+        )
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/conflicts", tags=["导入回放中心"], summary="获取导入作业冲突记录")
+def admin_get_import_job_conflicts(
+    job_id: str,
+    include_resolved: bool = Query(True, description="是否包含已解决的冲突"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_import_job_conflicts(
+            job_id=job_id,
+            user_id=x_user_id,
+            include_resolved=include_resolved,
+        )
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
+
+
+@app.post("/api/admin/import-replay/jobs/{job_id}/revoke", tags=["导入回放中心"], summary="撤销导入作业（恢复到导入前状态）")
+def admin_revoke_import_job(
+    job_id: str,
+    data: ImportRevokeRequest = None,
+    x_operator: Optional[str] = Header(None, description="操作人标识，用于审计追踪"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.revoke_import_job(
+            job_id=job_id,
+            operator=x_operator,
+            user_id=x_user_id,
+            reason=data.reason if data else None,
+        )
+        if not result.get("has_revoke_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有撤销导入的权限，请联系管理员授权",
+                        **result,
+                    }
+                },
+            )
+        if not result.get("success"):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": {
+                        "code": "REVOKE_ERROR",
+                        "message": result.get("message", "撤销失败"),
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "REVOKE_ERROR", 400)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/replay", tags=["导入回放中心"], summary="获取撤销后回放数据（验证撤销结果）")
+def admin_get_import_replay_data(
+    job_id: str,
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_import_replay_data(
+            job_id=job_id,
+            user_id=x_user_id,
+        )
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except ValueError as e:
+        error_response(str(e), "IMPORT_JOB_NOT_FOUND", 404)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/export/json", tags=["导入回放中心"], summary="导出导入作业为JSON")
+def admin_export_import_job_json(
+    job_id: str,
+    export_type: str = Query("full", description="导出类型: full/details/snapshots/conflicts/audit_log"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.export_import_job_json(
+            job_id=job_id,
+            user_id=x_user_id,
+            export_type=export_type,
+        )
+        if not result.get("has_export_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导出导入审计数据的权限",
+                        **result,
+                    }
+                },
+            )
+        return JSONResponse(
+            content=result["data"],
+            headers={
+                "Content-Disposition": f"attachment; filename={result['filename']}"
+            },
+        )
+    except ValueError as e:
+        error_response(str(e), "EXPORT_ERROR", 400)
+
+
+@app.get("/api/admin/import-replay/jobs/{job_id}/export/csv", tags=["导入回放中心"], summary="导出导入作业为CSV")
+def admin_export_import_job_csv(
+    job_id: str,
+    export_type: str = Query("details", description="导出类型: details/diff/conflicts"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.export_import_job_csv(
+            job_id=job_id,
+            user_id=x_user_id,
+            export_type=export_type,
+        )
+        if not result.get("has_export_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导出导入审计数据的权限",
+                        **result,
+                    }
+                },
+            )
+        return PlainTextResponse(
+            content=result["data"],
+            media_type="text/csv; charset=utf-8-sig",
+            headers={
+                "Content-Disposition": f"attachment; filename={result['filename']}"
+            },
+        )
+    except ValueError as e:
+        error_response(str(e), "EXPORT_ERROR", 400)
+
+
+@app.get("/api/admin/import-replay/audit-log", tags=["导入回放中心"], summary="获取结构化审计日志")
+def admin_get_structured_audit_log(
+    job_id: Optional[str] = Query(None, description="按导入作业ID过滤"),
+    rule_code: Optional[str] = Query(None, description="按规则code过滤"),
+    operation: Optional[str] = Query(None, description="按操作类型过滤: create/update/delete"),
+    start_time: Optional[str] = Query(None, description="开始时间 YYYY-MM-DD HH:MM:SS"),
+    end_time: Optional[str] = Query(None, description="结束时间 YYYY-MM-DD HH:MM:SS"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(50, ge=1, le=200, description="每页条数"),
+    x_user_id: Optional[str] = Header(None, description="当前用户ID，用于权限检查"),
+):
+    try:
+        result = SourceRuleService.get_structured_audit_log(
+            user_id=x_user_id,
+            job_id=job_id,
+            rule_code=rule_code,
+            operation=operation,
+            start_time=start_time,
+            end_time=end_time,
+            page=page,
+            page_size=page_size,
+        )
+        if not result.get("has_audit_permission"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "没有导入审计权限，无法查看敏感明细",
+                        **result,
+                    }
+                },
+            )
+        return result
+    except Exception as e:
+        error_response(str(e), "AUDIT_LOG_ERROR", 400)
+
+
+@app.post("/api/admin/import-replay/permissions/grant", tags=["导入回放中心"], summary="授予导入审计权限")
+def admin_grant_import_permission(
+    data: GrantImportPermissionRequest,
+    x_operator: Optional[str] = Header(None, description="授权人标识"),
+):
+    try:
+        return SourceRuleService.grant_import_permission(
+            target_user_id=data.target_user_id,
+            permission_type=data.permission_type,
+            granted_by=x_operator,
+            expires_at=data.expires_at,
+        )
+    except ValueError as e:
+        error_response(str(e), "PERMISSION_GRANT_ERROR", 400)
 
 
 # ========== 员工 - 菜单浏览 ==========
