@@ -1135,8 +1135,8 @@ def test_11_pattern_matching(ctx):
 # Test 12: Auto source detection
 # ============================================================
 
-def test_12_auto_source_detection(ctx):
-    print_section("测试 12: 自动来源检测")
+def test_12_missing_source_rejection(ctx):
+    print_section("测试 12: 缺来源拒绝")
 
     ok = True
 
@@ -1145,37 +1145,74 @@ def test_12_auto_source_detection(ctx):
         "menu_item_id": ctx["item3_id"],
         "quantity": 1,
         "serving_date": ctx["today"],
-        "remark": "自动来源检测测试",
     })
-
-    if r.status_code != 200:
-        print_test("无source补录返回200", False, f"状态码 {r.status_code}: {safe_json(r)}")
-        ok = False
-        return
-
-    order = r.json()
-    print_test("自动检测source为window", order.get("source") == "window",
-               f"source={order.get('source')}")
-    if order.get("source") != "window":
-        ok = False
-
-    print_test("返回包含matched_source_rule", "matched_source_rule" in order,
-               f"keys={list(order.keys())}")
-    if "matched_source_rule" not in order:
+    print_test("缺source返回400", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
         ok = False
     else:
-        rule = order["matched_source_rule"]
-        print_test("自动匹配规则code为window", rule.get("code") == "window",
-                   f"code={rule.get('code')}")
-        if rule.get("code") != "window":
+        body = safe_json(r)
+        err_info = body.get("detail", body)
+        err_code = err_info.get("code", "")
+        err_msg = err_info.get("message", "") or err_info.get("detail", "")
+        print_test("错误码为MISSING_SOURCE", err_code == "MISSING_SOURCE",
+                   f"code={err_code}")
+        print_test("错误信息包含来源不能为空", "来源不能为空" in str(err_msg),
+                   f"msg={str(err_msg)[:200]}")
+        if err_code != "MISSING_SOURCE" or "来源不能为空" not in str(err_msg):
             ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR003",
+        "menu_item_id": ctx["item3_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": None,
+    })
+    print_test("source为null返回400", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR003",
+        "menu_item_id": ctx["item3_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "",
+    })
+    print_test("source为空字符串返回400", r.status_code == 400, f"状态码 {r.status_code}")
+    if r.status_code != 400:
+        ok = False
+
+    r = api("POST", "/api/admin/orders/makeup", json={
+        "employee_id": "SR003",
+        "menu_item_id": ctx["item3_id"],
+        "quantity": 1,
+        "serving_date": ctx["today"],
+        "source": "admin",
+    })
+    print_test("正常传source返回200", r.status_code == 200, f"状态码 {r.status_code}")
+    if r.status_code == 200:
+        order = r.json()
+        print_test("正常补录source为admin", order.get("source") == "admin",
+                   f"source={order.get('source')}")
+        print_test("正常补录matched_source_rule非null", order.get("matched_source_rule") is not None,
+                   f"rule={order.get('matched_source_rule')}")
+        if order.get("source") != "admin" or order.get("matched_source_rule") is None:
+            ok = False
+    else:
+        ok = False
+
+    r = api("GET", "/api/admin/orders/makeup", params={"source": "admin"})
+    data = r.json()
+    print_test("按来源admin可筛选到补录", data.get("total", 0) >= 1,
+               f"total={data.get('total', 0)}")
 
     reconc = api("GET", "/api/admin/reconciliation").json()
     print_test("对账一致", reconc["consistent"], f"Issues: {reconc.get('issues', [])}")
     if not reconc["consistent"]:
         ok = False
 
-    print_test("自动来源检测总结果", ok)
+    print_test("缺来源拒绝总结果", ok)
 
 
 # ============================================================
@@ -1862,7 +1899,7 @@ def main():
         test_09_import_dry_run(ctx)
         test_10_makeup_with_source_rules(ctx)
         test_11_pattern_matching(ctx)
-        test_12_auto_source_detection(ctx)
+        test_12_missing_source_rejection(ctx)
         test_13_disabled_rule_blocking(ctx)
         test_14_priority_override(ctx)
         test_16_audit_log(ctx)

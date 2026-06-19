@@ -329,6 +329,8 @@ def admin_makeup_order(
             error_response(msg, "DATE_MISMATCH", 400)
         elif "超出允许范围" in msg or "不能晚于今天" in msg or "超过" in msg and "天" in msg:
             error_response(msg, "DATE_OUT_OF_RANGE", 400)
+        elif "来源不能为空" in msg:
+            error_response(msg, "MISSING_SOURCE", 400)
         elif "未命中任何来源规则" in msg:
             error_response(msg, "UNMATCHED_SOURCE", 400)
         elif "已禁用" in msg and "来源规则" in msg:

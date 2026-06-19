@@ -255,6 +255,14 @@ class OrderService:
 
         detected_source, matched_rule = SourceRuleService.detect_source(source, remark, conn=get_db())
 
+        if source is None or source == "":
+            logger.warning(json.dumps({
+                "event": "makeup_source_missing",
+                "employee_id": employee_id,
+                "menu_item_id": menu_item_id,
+            }, ensure_ascii=False))
+            raise ValueError("补录来源不能为空")
+
         if source and not matched_rule:
             _, _, rule_from_validate = SourceRuleService.validate_source(source, conn=get_db())
             if rule_from_validate and not rule_from_validate.is_enabled:
